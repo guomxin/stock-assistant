@@ -1,0 +1,49 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python runtime
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Local run state and logs
+logs/
+run/
+*.pid
+*.lock
+
+# Generated data stores
+db/
+data/raw/
+data/factors/
+*.duckdb
+*.parquet
+
+# Generated analysis outputs
+analysis/h30269/*.csv
+analysis/h30269/*.json
+analysis/h30269/*.md
+analysis/h30269/daily_close_reports/
+analysis/h30269/xueqiu_posts/
+
+# Keep source-facing project documents tracked
+!CODEX_HANDOFF.md
+!CODEX_LOCAL_KNOWLEDGE.md
+!README.md
+!OPERATIONS.md
+!requirements.txt
+!config/
+!config/**
+!scripts/
+!scripts/*.py
+!scripts/*.sh
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
