@@ -9,6 +9,8 @@
 - 查询服务：`scripts/query_server.py`
 - H30269 主任务：`scripts/run_h30269_action_report.sh`
 - 只读巡检：`scripts/smoke_check.sh`
+- 关键数据备份：`scripts/run_backup.sh`
+- 维护 cron 安装：`scripts/install_maintenance_cron.sh`
 
 ## 快速检查
 
@@ -29,3 +31,4 @@ scripts/smoke_check.sh
 - `.env` 保存 Tushare 和雪球生产凭据，不要打印、提交或同步到不可信位置。
 - `morning-close` 和 `afternoon-close` H30269 任务会真实发雪球。
 - 当前目录已经初始化为 git 仓库，默认分支为 `main`。生产数据和凭据由 `.gitignore` 保护。
+- 本机备份默认写入 `backups/`，归档内包含 `.env`，目录权限应保持仅当前用户可读写。

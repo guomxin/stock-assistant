@@ -88,6 +88,9 @@ python-dotenv>=1.0
 - `scripts/build_h30269_xueqiu_post.py`：生成雪球文案。
 - `scripts/post_xueqiu_status.py`：雪球 HTTP 发帖。
 - `scripts/xueqiu_waf_refresh.py`：雪球 WAF/Cookie 刷新。
+- `scripts/smoke_check.sh`：只读巡检脚本。
+- `scripts/run_backup.sh`：关键凭据、数据库、H30269 收盘归档和雪球发帖历史备份。
+- `scripts/install_maintenance_cron.sh`：安装巡检和备份 cron。
 
 ## 5. 查询服务
 
@@ -411,6 +414,9 @@ scripts/post_xueqiu_status.py \
 0 10 * * 1-5 cd /mnt/ssd01/stocks && /mnt/ssd01/stocks/scripts/run_h30269_action_report.sh 10:00 >> /mnt/ssd01/stocks/logs/h30269_action_report.log 2>&1 # h30269-action-report
 35 11 * * 1-5 cd /mnt/ssd01/stocks && /mnt/ssd01/stocks/scripts/run_h30269_action_report.sh morning-close >> /mnt/ssd01/stocks/logs/h30269_action_report.log 2>&1 # h30269-action-report
 30 18 * * 1-5 cd /mnt/ssd01/stocks && /mnt/ssd01/stocks/scripts/run_h30269_action_report.sh afternoon-close >> /mnt/ssd01/stocks/logs/h30269_action_report.log 2>&1 # h30269-action-report
+15 9 * * 1-5 cd /mnt/ssd01/stocks && /mnt/ssd01/stocks/scripts/smoke_check.sh >> /mnt/ssd01/stocks/logs/smoke_check.log 2>&1 # stocks-smoke-check
+50 19 * * 1-5 cd /mnt/ssd01/stocks && /mnt/ssd01/stocks/scripts/smoke_check.sh >> /mnt/ssd01/stocks/logs/smoke_check.log 2>&1 # stocks-smoke-check
+30 22 * * 1-5 cd /mnt/ssd01/stocks && /mnt/ssd01/stocks/scripts/run_backup.sh >> /mnt/ssd01/stocks/logs/backup.log 2>&1 # stocks-backup
 ```
 
 时间区：本机 `date` 显示 `CST +0800`。这些 cron 时间按本机时区执行。
@@ -466,6 +472,24 @@ H30269_OFFICIAL_DAILY_MAX_ATTEMPTS=1 scripts/run_h30269_action_report.sh afterno
 ```
 
 注意：真实 `morning-close` 和 `afternoon-close` 会发雪球。调试时如不想发帖，单独跑下游脚本或使用 `post_xueqiu_status.py --dry-run/--validate-only`。
+
+备份脚本：
+
+```bash
+cd /mnt/ssd01/stocks
+scripts/run_backup.sh
+```
+
+默认备份目录为 `backups/`，包含 `.env`、`db/a_share_factors.duckdb`、H30269 收盘归档、雪球发帖历史和 crontab 快照。归档文件权限为 `600`，备份目录权限为 `700`，默认保留 30 天。
+
+维护 cron：
+
+```bash
+cd /mnt/ssd01/stocks
+scripts/install_maintenance_cron.sh
+```
+
+安装后会在交易日 09:15 和 19:50 运行巡检，在交易日 22:30 运行备份。
 
 ## 13. 排障优先级
 

@@ -144,6 +144,8 @@ crontab -l
 - 10:00 H30269 盘中报告
 - 11:35 H30269 中午报告并发雪球
 - 18:30 H30269 收盘报告并发雪球
+- 09:15 和 19:50 只读巡检
+- 22:30 关键数据备份
 
 ## 日志
 
@@ -166,3 +168,66 @@ scripts/smoke_check.sh
 ```
 
 这个脚本只读取本机状态，不抓取数据，不发雪球。
+
+## 备份
+
+手动备份：
+
+```bash
+cd /mnt/ssd01/stocks
+scripts/run_backup.sh
+```
+
+默认备份目录：
+
+```text
+/mnt/ssd01/stocks/backups
+```
+
+备份内容：
+
+- `.env`
+- `db/a_share_factors.duckdb`
+- `analysis/h30269/daily_close_reports/`
+- `logs/xueqiu_post_history.jsonl`
+- `logs/xueqiu_cookie_alert.json`，如果存在
+- `CODEX_LOCAL_KNOWLEDGE.md`
+- `OPERATIONS.md`
+- `README.md`
+- 当前 crontab 快照
+
+备份文件形如：
+
+```text
+backups/stocks_backup_YYYYMMDD_HHMMSS.tar.gz
+backups/stocks_backup_YYYYMMDD_HHMMSS.tar.gz.sha256
+```
+
+默认保留 30 天。可通过环境变量调整：
+
+```bash
+STOCKS_BACKUP_RETENTION_DAYS=60 scripts/run_backup.sh
+STOCKS_BACKUP_DIR=/path/to/secure/backup scripts/run_backup.sh
+```
+
+注意：备份包包含 `.env`，不要提交、公开上传或发给不可信对象。
+
+## 维护 cron
+
+安装巡检和备份 cron：
+
+```bash
+cd /mnt/ssd01/stocks
+scripts/install_maintenance_cron.sh
+```
+
+安装后任务：
+
+- 交易日 09:15：运行 `scripts/smoke_check.sh`，写入 `logs/smoke_check.log`
+- 交易日 19:50：运行 `scripts/smoke_check.sh`，写入 `logs/smoke_check.log`
+- 交易日 22:30：运行 `scripts/run_backup.sh`，写入 `logs/backup.log`
+
+脚本使用 marker 替换旧行：
+
+- `# stocks-smoke-check`
+- `# stocks-backup`
