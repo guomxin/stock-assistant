@@ -1,5 +1,7 @@
 # 远端 Codex 交接文档
 
+> 历史归档说明：后续开发以 `CODEX_LOCAL_KNOWLEDGE.md` 为准。本文件保留远端迁移背景，其中旧写法 `市赚率 = PE(TTM) / ROE(%) / 100` 已被本机代码口径覆盖；当前正式口径为 `PE(TTM) / ROE百分点`。
+
 目标读者：安装在 `guomxin.imwork.net` 远端 Ubuntu 机器上的 Codex。
 
 项目根目录：`/mnt/ssd01/stocks`
@@ -105,10 +107,16 @@ curl -s http://127.0.0.1:8088/h30269 | head
   - 市赚率
   - 股价
   - 总市值，单位为“亿”
-- 市赚率计算：
+- 市赚率计算，历史写法，已废弃：
 
 ```text
 市赚率 = PE(TTM) / ROE(%) / 100
+```
+
+当前正式口径见 `CODEX_LOCAL_KNOWLEDGE.md`，以 `scripts/query_server.py` 代码为准：
+
+```text
+市赚率 = PE(TTM) / ROE百分点
 ```
 
 注意：Tushare 的 ROE 字段是百分数点，不是 0-1 小数。页面应标注为 `ROE(%)`。
