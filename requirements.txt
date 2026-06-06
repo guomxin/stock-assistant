@@ -3,3 +3,4 @@ pandas>=2.0
 pyarrow>=14.0
 duckdb>=0.10
 python-dotenv>=1.0
+lxml>=5.0

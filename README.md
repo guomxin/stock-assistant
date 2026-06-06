@@ -10,6 +10,8 @@
 - H30269 主任务：`scripts/run_h30269_action_report.sh`
 - 纳斯达克100数据抓取：`scripts/fetch_nasdaq100.py`
 - 纳斯达克100评分与策略研究：`scripts/analyze_nasdaq100_strategy.py`
+- 纳斯达克100当前成分股价格抓取：`scripts/fetch_nasdaq100_constituent_prices.py`
+- 纳斯达克100成分股长-only轮动研究：`scripts/research_nasdaq100_constituent_strategy.py`
 - 只读巡检：`scripts/smoke_check.sh`
 - 关键数据备份：`scripts/run_backup.sh`
 - 维护 cron 安装：`scripts/install_maintenance_cron.sh`
