@@ -2,8 +2,9 @@
 """Research long-only Nasdaq-100 constituent rotation strategies.
 
 This script intentionally uses only non-negative weights summing to at most 100%.
-The current implementation uses the latest available Nasdaq-100 constituent list,
-so historical backtests have survivorship bias and should be treated as exploratory.
+When Wikipedia's change table is available it reconstructs an approximate historical
+membership set.  Delisted/acquired tickers may still be missing from Yahoo, so the
+backtest remains an approximation rather than a perfect point-in-time index replay.
 """
 
 from __future__ import annotations
@@ -53,6 +54,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", default=DEFAULT_START_DATE)
     parser.add_argument("--end-date", default=datetime.now().strftime("%Y%m%d"))
     parser.add_argument("--cost", type=float, default=DEFAULT_COST)
+    parser.add_argument(
+        "--membership-mode",
+        choices=["reconstructed", "current"],
+        default="reconstructed",
+        help="Use Wikipedia change table reconstruction or the latest constituent list only.",
+    )
     return parser.parse_args()
 
 
@@ -78,7 +85,22 @@ def load_constituents() -> pd.DataFrame:
     return df
 
 
-def load_prices(symbols: list[str], start_date: str, end_date: str) -> pd.DataFrame:
+def load_changes() -> pd.DataFrame:
+    path = latest_file(CONSTITUENT_DIR, "nasdaq100_changes_*.parquet")
+    df = pd.read_parquet(path).sort_values("trade_date", ascending=False).reset_index(drop=True)
+    df["change_cache_path"] = str(path)
+    return df
+
+
+def universe_symbols(constituents: pd.DataFrame, changes: pd.DataFrame | None, membership_mode: str) -> list[str]:
+    symbols = set(constituents["yahoo_symbol"].astype(str))
+    if membership_mode == "reconstructed" and changes is not None:
+        for column in ["added_yahoo_symbol", "removed_yahoo_symbol"]:
+            symbols.update(s for s in changes[column].astype(str) if s and s.lower() != "nan")
+    return sorted(symbols)
+
+
+def load_prices(symbols: list[str], start_date: str, end_date: str) -> tuple[pd.DataFrame, list[str]]:
     frames = []
     missing = []
     for symbol in symbols:
@@ -94,12 +116,42 @@ def load_prices(symbols: list[str], start_date: str, end_date: str) -> pd.DataFr
         keep["trade_date"] = keep["trade_date"].astype(str)
         keep = keep.rename(columns={"adj_close": symbol})
         frames.append(keep)
-    if missing:
+    if missing and not frames:
         raise FileNotFoundError(f"Missing cached prices for: {', '.join(missing)}")
     prices = frames[0]
     for frame in frames[1:]:
         prices = prices.merge(frame, on="trade_date", how="outer")
-    return prices.sort_values("trade_date").set_index("trade_date")
+    return prices.sort_values("trade_date").set_index("trade_date"), sorted(missing)
+
+
+def build_membership(
+    dates: pd.Index,
+    price_columns: pd.Index,
+    constituents: pd.DataFrame,
+    changes: pd.DataFrame | None,
+    membership_mode: str,
+) -> pd.DataFrame:
+    columns = list(price_columns)
+    if membership_mode == "current" or changes is None:
+        return pd.DataFrame(True, index=dates, columns=columns)
+
+    current = set(constituents["yahoo_symbol"].astype(str)).intersection(columns)
+    change_rows = changes[["trade_date", "added_yahoo_symbol", "removed_yahoo_symbol"]].copy()
+    change_rows["added_yahoo_symbol"] = change_rows["added_yahoo_symbol"].fillna("").astype(str)
+    change_rows["removed_yahoo_symbol"] = change_rows["removed_yahoo_symbol"].fillna("").astype(str)
+    rows = []
+    for date in dates:
+        active = set(current)
+        future_changes = change_rows[change_rows["trade_date"] > str(date)]
+        for _, change in future_changes.iterrows():
+            added = change["added_yahoo_symbol"]
+            removed = change["removed_yahoo_symbol"]
+            if added:
+                active.discard(added)
+            if removed and removed in columns:
+                active.add(removed)
+        rows.append([symbol in active for symbol in columns])
+    return pd.DataFrame(rows, index=dates, columns=columns)
 
 
 def load_benchmark(start_date: str, end_date: str) -> pd.Series:
@@ -187,7 +239,7 @@ def rebalance_dates(index: pd.Index, freq: str) -> pd.Index:
     return pd.DataFrame({"key": keys}, index=index).groupby("key").tail(1).index
 
 
-def build_weights(prices: pd.DataFrame, meta: dict) -> pd.DataFrame:
+def build_weights(prices: pd.DataFrame, membership: pd.DataFrame, meta: dict) -> pd.DataFrame:
     features = build_feature_data(prices)
     scores = score_frame(features, str(meta["family"]))
     dates = prices.index
@@ -199,6 +251,7 @@ def build_weights(prices: pd.DataFrame, meta: dict) -> pd.DataFrame:
     for date in rebal_idx:
         score = scores.loc[date].copy()
         eligible = score.notna() & features["ret_252_skip21"].loc[date].notna() & features["vol_126"].loc[date].notna()
+        eligible &= membership.loc[date].reindex(prices.columns).fillna(False)
         if bool(meta["require_positive_momentum"]):
             eligible &= features["ret_252_skip21"].loc[date] > 0
         if bool(meta["require_ma200"]):
@@ -211,8 +264,14 @@ def build_weights(prices: pd.DataFrame, meta: dict) -> pd.DataFrame:
     return weights.ffill().fillna(0.0)
 
 
-def backtest(prices: pd.DataFrame, benchmark: pd.Series, meta: dict, cost: float) -> tuple[pd.DataFrame, Metric]:
-    target = build_weights(prices, meta)
+def backtest(
+    prices: pd.DataFrame,
+    benchmark: pd.Series,
+    membership: pd.DataFrame,
+    meta: dict,
+    cost: float,
+) -> tuple[pd.DataFrame, Metric]:
+    target = build_weights(prices, membership, meta)
     stock_ret = prices.pct_change().reindex(target.index).fillna(0.0)
     position = target.shift(1).fillna(0.0)
     turnover = position.sub(position.shift(1).fillna(0.0)).abs().sum(axis=1)
@@ -295,7 +354,13 @@ def candidate_grid() -> list[dict]:
     return rows
 
 
-def run_research(prices: pd.DataFrame, benchmark: pd.Series, cost: float) -> tuple[pd.DataFrame, dict, pd.DataFrame, pd.DataFrame]:
+def run_research(
+    prices: pd.DataFrame,
+    benchmark: pd.Series,
+    membership: pd.DataFrame,
+    cost: float,
+    data_meta: dict,
+) -> tuple[pd.DataFrame, dict, pd.DataFrame, pd.DataFrame]:
     rows = []
     nav_map = {}
     bench_metric = metric_from_returns(benchmark.reindex(prices.index).ffill().pct_change().fillna(0.0))
@@ -304,7 +369,7 @@ def run_research(prices: pd.DataFrame, benchmark: pd.Series, cost: float) -> tup
             f"{meta['freq']}_{meta['family']}_top{meta['top_n']}"
             f"_mom{int(meta['require_positive_momentum'])}_ma{int(meta['require_ma200'])}"
         )
-        nav, full = backtest(prices, benchmark, meta, cost)
+        nav, full = backtest(prices, benchmark, membership, meta, cost)
         train = segment_metric(nav, "strategy_ret", "2007-01-01", "2015-12-31")
         valid = segment_metric(nav, "strategy_ret", "2016-01-01", "2021-12-31")
         test = segment_metric(nav, "strategy_ret", "2022-01-01", None)
@@ -349,7 +414,7 @@ def run_research(prices: pd.DataFrame, benchmark: pd.Series, cost: float) -> tup
     ).reset_index(drop=True)
     if not target_pass.empty:
         selected = target_pass.sort_values(
-            ["cagr", "sharpe", "max_drawdown", "turnover_per_year"],
+            ["sharpe", "max_drawdown", "cagr", "turnover_per_year"],
             ascending=[False, False, False, True],
         ).iloc[0].to_dict()
     elif not constrained.empty:
@@ -366,18 +431,18 @@ def run_research(prices: pd.DataFrame, benchmark: pd.Series, cost: float) -> tup
         "max_acceptable_drawdown": MAX_ACCEPTABLE_DRAWDOWN,
         "max_turnover_per_year": MAX_TURNOVER_PER_YEAR,
         "max_rebalances_per_year": MAX_REBALANCES_PER_YEAR,
+        "selection_policy": "target_pass_then_sharpe_drawdown_cagr_turnover",
         "no_leverage": True,
         "no_short": True,
-        "uses_current_constituents": True,
-        "survivorship_bias_warning": True,
-        "target_met_exploratory": bool(not target_pass.empty),
+        **data_meta,
+        "target_met": bool(not target_pass.empty),
         "benchmark": bench_metric.__dict__,
         "selected": selected,
         "target_pass_candidates": int(len(target_pass)),
         "constrained_candidates": int(len(constrained)),
         "total_candidates": int(len(grid)),
     }
-    return grid, summary, selected_nav, build_weights(prices, selected)
+    return grid, summary, selected_nav, build_weights(prices, membership, selected)
 
 
 def describe_strategy(selected: dict) -> str:
@@ -389,7 +454,7 @@ def describe_strategy(selected: dict) -> str:
         filters.append("价格在 MA200 之上")
     filter_text = "，并要求" + "且".join(filters) if filters else ""
     return (
-        f"{freq_text}调仓一次；在当前纳指100成分股中按 `{selected['family']}` 分数排序{filter_text}，"
+        f"{freq_text}调仓一次；在当期纳指100成分池中按 `{selected['family']}` 分数排序{filter_text}，"
         f"等权持有前 {int(selected['top_n'])} 只股票；不满足持仓数量时保留现金。"
     )
 
@@ -421,7 +486,9 @@ def write_outputs(
     top["changes_per_year_fmt"] = top["changes_per_year"].map(lambda x: fmt_num(x, 2))
     display_weights = latest_weights.head(20).copy()
     display_weights["weight_fmt"] = display_weights["weight"].map(fmt_pct)
-    status = "通过（探索性，存在幸存者偏差）" if summary["target_met_exploratory"] else "未通过"
+    status = "通过" if summary["target_met"] else "未通过"
+    if summary["membership_mode"] == "current":
+        status = f"{status}（探索性，存在幸存者偏差）"
 
     report = f"""# 纳斯达克100成分股长-only轮动策略研究
 
@@ -429,7 +496,12 @@ def write_outputs(
 
 ## 当前结论
 
-- 数据范围：当前纳斯达克100成分股 {len(constituents)} 只，Yahoo Finance 复权日线
+- 成分模式：{summary['membership_mode']}
+- 当前成分股数量：{summary['current_constituents']}
+- 变更记录数量：{summary['change_rows']}
+- 历史候选 ticker：{summary['universe_symbols']}，有价格覆盖：{summary['priced_symbols']}，缺失价格：{summary['missing_price_symbols']}
+- 当期成分价格覆盖：平均 {fmt_pct(float(summary['active_price_coverage_avg']))}，10分位 {fmt_pct(float(summary['active_price_coverage_p10']))}，最低 {fmt_pct(float(summary['active_price_coverage_min']))}，最新 {fmt_pct(float(summary['active_price_coverage_latest']))}
+- 数据来源：Wikipedia 纳指100当前成分与变更表，Yahoo Finance 复权日线
 - 回测区间：{selected_nav['trade_date'].iloc[0]} 至 {selected_nav['trade_date'].iloc[-1]}
 - 目标检验：**{status}**
 - 选中策略：`{selected['name']}`
@@ -442,7 +514,7 @@ def write_outputs(
 - 年均调仓发生次数：{fmt_num(float(selected['changes_per_year']), 2)}
 - 目标筛选通过数量：{summary['target_pass_candidates']} / {summary['total_candidates']}
 
-重要限制：本报告使用的是“当前成分股”回看历史价格，不是历史真实成分股清单，因此存在明显幸存者偏差。它只能说明成分股多头轮动方向值得继续研究，不能直接作为已验证可执行结论。
+重要限制：`reconstructed` 模式用 Wikipedia 变更表反向重建历史成分池，已比“当前成分股回看历史”更接近真实，但仍不是官方点位成分数据库；部分退市或并购 ticker 无法从 Yahoo 取得价格，可能留下覆盖偏差。若 `membership_mode=current`，则存在明显幸存者偏差，只能视为探索性结果。
 
 ## 最新持仓建议
 
@@ -459,13 +531,15 @@ def write_outputs(
 
 筛选要求：年化超额不少于 {fmt_pct(MIN_EXCESS_CAGR)}，最大回撤不差于 {fmt_pct(MAX_ACCEPTABLE_DRAWDOWN)}，年均换手不超过 {fmt_num(MAX_TURNOVER_PER_YEAR, 2)} 倍，年均调仓发生次数不超过 {fmt_num(MAX_REBALANCES_PER_YEAR, 2)}，并且 2016-2021 与 2022 年后样本年化收益为正。
 
+选中原则：先满足目标筛选，再优先选择夏普更高、回撤更小的候选，其次比较年化收益和换手率。
+
 ## 候选策略前十五
 
 {markdown_table(top, ['name', 'cagr_fmt', 'excess_cagr_vs_buyhold_fmt', 'max_drawdown_fmt', 'annual_vol_fmt', 'test2022_cagr_fmt', 'turnover_per_year_fmt', 'changes_per_year_fmt'])}
 
 ## 后续工作
 
-若要把该路线变成可完成目标的正式结论，必须补齐历史纳指100成分股清单或找到可靠的历史成分数据库，消除当前成分股回测的幸存者偏差。
+若要进一步提高严谨性，应接入 Nasdaq 官方或商业数据库的点位历史成分与公司行为数据，减少 Yahoo 对退市 ticker 覆盖不足造成的偏差。
 """
     report_path = ANALYSIS_DIR / "nasdaq100_constituent_strategy_report.md"
     report_path.write_text(report, encoding="utf-8")
@@ -475,16 +549,44 @@ def write_outputs(
 def main() -> int:
     args = parse_args()
     constituents = load_constituents()
-    symbols = constituents["yahoo_symbol"].astype(str).tolist()
-    prices = load_prices(symbols, args.start_date, args.end_date)
+    changes = load_changes() if args.membership_mode == "reconstructed" else None
+    symbols = universe_symbols(constituents, changes, args.membership_mode)
+    prices, missing_symbols = load_prices(symbols, args.start_date, args.end_date)
     benchmark = load_benchmark(args.start_date, args.end_date)
     dates = benchmark.index.intersection(prices.index)
     prices = prices.reindex(dates).ffill()
-    warmup_dates = dates[dates >= "20061229"]
+    warmup_start = "20061229"
+    if args.membership_mode == "reconstructed" and changes is not None:
+        warmup_start = max(warmup_start, str(changes["trade_date"].min()))
+    warmup_dates = dates[dates >= warmup_start]
     prices = prices.loc[warmup_dates]
     benchmark = benchmark.loc[warmup_dates]
+    full_membership = build_membership(prices.index, pd.Index(symbols), constituents, changes, args.membership_mode)
+    membership = build_membership(prices.index, prices.columns, constituents, changes, args.membership_mode)
+    full_active = full_membership.sum(axis=1)
+    priced_active = membership.sum(axis=1)
+    active_coverage = priced_active / full_active.replace(0, np.nan)
+    data_meta = {
+        "membership_mode": args.membership_mode,
+        "current_constituents": int(len(constituents)),
+        "change_rows": int(len(changes)) if changes is not None else 0,
+        "universe_symbols": int(len(symbols)),
+        "priced_symbols": int(len(prices.columns)),
+        "missing_price_symbols": int(len(missing_symbols)),
+        "missing_price_symbol_list": missing_symbols,
+        "active_members_avg": float(full_active.mean()),
+        "priced_active_members_avg": float(priced_active.mean()),
+        "active_price_coverage_min": float(active_coverage.min()),
+        "active_price_coverage_avg": float(active_coverage.mean()),
+        "active_price_coverage_median": float(active_coverage.median()),
+        "active_price_coverage_p10": float(active_coverage.quantile(0.10)),
+        "active_price_coverage_latest": float(active_coverage.iloc[-1]),
+        "uses_current_constituents_only": args.membership_mode == "current",
+        "uses_reconstructed_membership": args.membership_mode == "reconstructed",
+        "coverage_bias_warning": bool(missing_symbols),
+    }
 
-    grid, summary, selected_nav, weights = run_research(prices, benchmark, args.cost)
+    grid, summary, selected_nav, weights = run_research(prices, benchmark, membership, args.cost, data_meta)
     latest = weights.iloc[-1]
     latest_weights = latest[latest > 0].sort_values(ascending=False).reset_index()
     latest_weights.columns = ["symbol", "weight"]
@@ -499,14 +601,15 @@ def main() -> int:
     selected = summary["selected"]
     benchmark_metric = summary["benchmark"]
     print(f"Report: {report_path}")
-    print(f"Constituents: {len(constituents)}")
-    print(f"Target met exploratory: {summary['target_met_exploratory']}")
+    print(f"Membership mode: {summary['membership_mode']}")
+    print(f"Constituents: {len(constituents)} current; universe={len(symbols)}; priced={len(prices.columns)}; missing={len(missing_symbols)}")
+    print(f"Target met: {summary['target_met']}")
     print(f"Selected strategy: {selected['name']}")
     print(f"Strategy CAGR: {selected['cagr']:.2%}; benchmark CAGR: {benchmark_metric['cagr']:.2%}")
     print(f"Excess CAGR: {selected['excess_cagr_vs_buyhold']:.2%}")
     print(f"Max drawdown: {selected['max_drawdown']:.2%}")
     print(f"Turnover/year: {selected['turnover_per_year']:.2f}; changes/year: {selected['changes_per_year']:.2f}")
-    print(f"Survivorship bias warning: {summary['survivorship_bias_warning']}")
+    print(f"Coverage bias warning: {summary['coverage_bias_warning']}")
     return 0
 
 

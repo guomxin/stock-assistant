@@ -28,6 +28,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-date", default=datetime.now().strftime("%Y%m%d"), help="End date in YYYYMMDD.")
     parser.add_argument("--refresh-constituents", action="store_true", help="Refetch the current constituent list.")
     parser.add_argument("--refresh-prices", action="store_true", help="Refetch prices even if cached.")
+    parser.add_argument(
+        "--include-historical-changes",
+        action="store_true",
+        help="Also parse Wikipedia's change table and fetch added/removed historical tickers.",
+    )
+    parser.add_argument("--allow-errors", action="store_true", help="Return success even if some historical tickers fail.")
     parser.add_argument("--sleep", type=float, default=0.2, help="Seconds to sleep between Yahoo requests.")
     parser.add_argument("--max-symbols", type=int, help="Fetch only the first N symbols, useful for smoke tests.")
     parser.add_argument("--csv", action="store_true", help="Also write CSV copies next to parquet outputs.")
@@ -58,6 +64,19 @@ def latest_constituent_cache() -> Path | None:
     return files[-1] if files else None
 
 
+def flatten_column(column) -> str:
+    if isinstance(column, tuple):
+        return " ".join(str(part) for part in column if str(part) != "nan").strip().lower()
+    return str(column).strip().lower()
+
+
+def read_wikipedia_tables() -> list[pd.DataFrame]:
+    request = Request(WIKIPEDIA_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(request, timeout=30) as response:
+        html = response.read()
+    return pd.read_html(html)
+
+
 def fetch_current_constituents(refresh: bool) -> pd.DataFrame:
     CONSTITUENT_DIR.mkdir(parents=True, exist_ok=True)
     output_path = CONSTITUENT_DIR / f"nasdaq100_constituents_{today_yyyymmdd()}.parquet"
@@ -68,16 +87,13 @@ def fetch_current_constituents(refresh: bool) -> pd.DataFrame:
     if cached and not refresh:
         return pd.read_parquet(cached)
 
-    request = Request(WIKIPEDIA_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urlopen(request, timeout=30) as response:
-        html = response.read()
-
-    tables = pd.read_html(html)
+    tables = read_wikipedia_tables()
     table = None
     for candidate in tables:
-        normalized = {str(col).strip().lower(): col for col in candidate.columns}
+        normalized = {flatten_column(col): col for col in candidate.columns}
         if "ticker" in normalized and "company" in normalized:
-            table = candidate.rename(columns={v: k for k, v in normalized.items()})
+            table = candidate.copy()
+            table.columns = [flatten_column(col) for col in candidate.columns]
             break
     if table is None:
         raise RuntimeError("Could not find Nasdaq-100 constituent table on Wikipedia.")
@@ -102,6 +118,79 @@ def fetch_current_constituents(refresh: bool) -> pd.DataFrame:
     keep = keep.drop_duplicates("yahoo_symbol").sort_values("yahoo_symbol").reset_index(drop=True)
     keep.to_parquet(output_path, index=False)
     return keep
+
+
+def clean_ticker(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return ""
+    return text
+
+
+def latest_change_cache() -> Path | None:
+    files = sorted(CONSTITUENT_DIR.glob("nasdaq100_changes_*.parquet"))
+    return files[-1] if files else None
+
+
+def fetch_historical_changes(refresh: bool) -> pd.DataFrame:
+    CONSTITUENT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = CONSTITUENT_DIR / f"nasdaq100_changes_{today_yyyymmdd()}.parquet"
+    if output_path.exists() and not refresh:
+        return pd.read_parquet(output_path)
+
+    cached = latest_change_cache()
+    if cached and not refresh:
+        return pd.read_parquet(cached)
+
+    tables = read_wikipedia_tables()
+    table = None
+    for candidate in tables:
+        normalized = {flatten_column(col): col for col in candidate.columns}
+        has_added = any("added" in key and "ticker" in key for key in normalized)
+        has_removed = any("removed" in key and "ticker" in key for key in normalized)
+        has_date = any(key == "date date" or key == "date" for key in normalized)
+        if has_date and has_added and has_removed:
+            table = candidate.copy()
+            table.columns = [flatten_column(col) for col in candidate.columns]
+            break
+    if table is None:
+        raise RuntimeError("Could not find Nasdaq-100 historical change table on Wikipedia.")
+
+    def find_col(*parts: str) -> str:
+        for col in table.columns:
+            text = str(col)
+            if all(part in text for part in parts):
+                return col
+        raise KeyError(parts)
+
+    date_col = find_col("date")
+    added_ticker_col = find_col("added", "ticker")
+    added_security_col = find_col("added", "security")
+    removed_ticker_col = find_col("removed", "ticker")
+    removed_security_col = find_col("removed", "security")
+    reason_col = find_col("reason")
+
+    out = pd.DataFrame(
+        {
+            "date": table[date_col],
+            "added_ticker": table[added_ticker_col].map(clean_ticker),
+            "added_security": table[added_security_col].fillna("").astype(str).str.strip(),
+            "removed_ticker": table[removed_ticker_col].map(clean_ticker),
+            "removed_security": table[removed_security_col].fillna("").astype(str).str.strip(),
+            "reason": table[reason_col].fillna("").astype(str).str.strip(),
+        }
+    )
+    parsed = pd.to_datetime(out["date"], errors="coerce")
+    out["trade_date"] = parsed.dt.strftime("%Y%m%d")
+    out["added_yahoo_symbol"] = out["added_ticker"].map(yahoo_symbol)
+    out["removed_yahoo_symbol"] = out["removed_ticker"].map(yahoo_symbol)
+    out["source_url"] = WIKIPEDIA_URL
+    out["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    out = out.dropna(subset=["trade_date"]).sort_values("trade_date", ascending=False).reset_index(drop=True)
+    out.to_parquet(output_path, index=False)
+    return out
 
 
 def yahoo_chart_url(symbol: str, start_date: str, end_date: str) -> str:
@@ -162,6 +251,15 @@ def main() -> int:
     args = parse_args()
     RAW_US_STOCK_DIR.mkdir(parents=True, exist_ok=True)
     constituents = fetch_current_constituents(args.refresh_constituents)
+    symbols = set(constituents["yahoo_symbol"].astype(str))
+    if args.include_historical_changes:
+        changes = fetch_historical_changes(args.refresh_constituents)
+        for column in ["added_yahoo_symbol", "removed_yahoo_symbol"]:
+            symbols.update(s for s in changes[column].astype(str) if s and s.lower() != "nan")
+        constituents = pd.DataFrame({"yahoo_symbol": sorted(symbols)})
+    else:
+        constituents = constituents[["yahoo_symbol"]].copy()
+
     if args.max_symbols:
         constituents = constituents.head(args.max_symbols).copy()
 
@@ -215,7 +313,7 @@ def main() -> int:
     print(f"price_success={(manifest['rows'] > 0).sum()}")
     print(f"price_errors={(manifest['rows'] == 0).sum()}")
     print(f"manifest={manifest_path}")
-    return 0 if (manifest["rows"] > 0).all() else 2
+    return 0 if args.allow_errors or (manifest["rows"] > 0).all() else 2
 
 
 if __name__ == "__main__":
