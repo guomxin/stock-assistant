@@ -362,6 +362,12 @@ def generate_candidates(df: pd.DataFrame) -> list[tuple[str, np.ndarray, dict]]:
     close = df["close"]
     score = df["score"]
 
+    def ma_for(window: int) -> pd.Series:
+        column = f"ma{window}"
+        if column in df:
+            return df[column]
+        return close.rolling(window, min_periods=max(50, window // 2)).mean()
+
     def add(name: str, raw: np.ndarray | pd.Series, meta: dict) -> None:
         raw_array = pd.Series(raw, index=df.index).ffill().fillna(1.0).clip(MIN_POSITION, MAX_POSITION).to_numpy()
         candidates.append((name, raw_array, meta))
@@ -370,7 +376,7 @@ def generate_candidates(df: pd.DataFrame) -> list[tuple[str, np.ndarray, dict]]:
 
     for base in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]:
         for window in [50, 100, 150, 200, 250]:
-            ma = df[f"ma{window if window in [50, 100, 150, 200, 250] else 200}"]
+            ma = ma_for(window)
             for low in [3.0, 3.5, 4.0, 4.5]:
                 raw = base + (1 - base) * ((close > ma) | (score <= low)).astype(float)
                 for freq in ["daily", "weekly", "monthly"]:
@@ -382,7 +388,7 @@ def generate_candidates(df: pd.DataFrame) -> list[tuple[str, np.ndarray, dict]]:
 
     for base in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]:
         for window in [50, 100, 150, 200, 250]:
-            ma = df[f"ma{window}"]
+            ma = ma_for(window)
             for low in [3.0, 3.5, 4.0, 4.5]:
                 for band in [0.01, 0.02, 0.03, 0.05]:
                     enter = (close > ma * (1 + band)) | (score <= low)
@@ -414,7 +420,7 @@ def generate_candidates(df: pd.DataFrame) -> list[tuple[str, np.ndarray, dict]]:
 
     for base in [0.0, 0.2, 0.3, 0.5, 0.7]:
         for window in [100, 150, 200, 250]:
-            ma = df[f"ma{window}"]
+            ma = ma_for(window)
             for high in [6.5, 7.0, 7.5, 8.0]:
                 raw = np.where((score >= high) & (close < ma), base, 1.0)
                 for freq in ["daily", "weekly", "monthly"]:
@@ -422,6 +428,64 @@ def generate_candidates(df: pd.DataFrame) -> list[tuple[str, np.ndarray, dict]]:
                         f"{freq}_risk_off_high_base{base:.1f}_ma{window}_high{high:.1f}",
                         rebalance_signal(df, raw, freq),
                         {"family": "risk_off_high", "base": base, "ma": window, "high_score": high, "freq": freq},
+                    )
+
+    for base in [0.0, 0.1, 0.2, 0.3, 0.5, 0.7]:
+        for window in [100, 125, 150, 200, 250, 300]:
+            ma = ma_for(window)
+            for low in [4.0, 4.5, 5.0]:
+                for high in [7.5, 8.0, 8.5]:
+                    raw = base + (1 - base) * (((close > ma) & (score < high)) | (score <= low)).astype(float)
+                    for freq in ["weekly", "monthly"]:
+                        add(
+                            f"{freq}_trend_score_base{base:.1f}_ma{window}_low{low:.1f}_high{high:.1f}",
+                            rebalance_signal(df, raw, freq),
+                            {
+                                "family": "trend_score",
+                                "base": base,
+                                "ma": window,
+                                "low_score": low,
+                                "high_score": high,
+                                "freq": freq,
+                            },
+                        )
+
+    for base in [0.0, 0.2, 0.5]:
+        for window in [100, 150, 200, 250]:
+            ma = ma_for(window)
+            for ret_days in [60, 120, 250]:
+                for ret_min in [0.0, 0.05, 0.10]:
+                    raw = base + (1 - base) * ((close > ma) & (df[f"ret_{ret_days}"] > ret_min)).astype(float)
+                    for freq in ["weekly", "monthly"]:
+                        add(
+                            f"{freq}_trend_momentum_base{base:.1f}_ma{window}_ret{ret_days}_min{ret_min:.2f}",
+                            rebalance_signal(df, raw, freq),
+                            {
+                                "family": "trend_momentum",
+                                "base": base,
+                                "ma": window,
+                                "ret_days": ret_days,
+                                "ret_min": ret_min,
+                                "freq": freq,
+                            },
+                        )
+
+    for base in [0.0, 0.2, 0.5]:
+        for window in [100, 125, 150, 200, 250]:
+            ma = ma_for(window)
+            for drawdown_limit in [-0.05, -0.10, -0.15, -0.20, -0.30]:
+                raw = base + (1 - base) * ((close > ma) | (df["dd_3y"] <= drawdown_limit)).astype(float)
+                for freq in ["weekly", "monthly"]:
+                    add(
+                        f"{freq}_trend_drawdown_base{base:.1f}_ma{window}_dd{drawdown_limit:.2f}",
+                        rebalance_signal(df, raw, freq),
+                        {
+                            "family": "trend_drawdown",
+                            "base": base,
+                            "ma": window,
+                            "drawdown_limit": drawdown_limit,
+                            "freq": freq,
+                        },
                     )
 
     return candidates
@@ -541,6 +605,9 @@ def describe_strategy(selected: dict) -> str:
     low_score = selected.get("low_score")
     band = selected.get("band")
     high_score = selected.get("high_score")
+    ret_days = selected.get("ret_days")
+    ret_min = selected.get("ret_min")
+    drawdown_limit = selected.get("drawdown_limit")
 
     if family == "band":
         return (
@@ -558,6 +625,21 @@ def describe_strategy(selected: dict) -> str:
         return (
             f"{freq_text}确认一次目标仓位；若评分 >= {float(high_score):.1f} 且收盘价低于 MA{int(ma)}，"
             f"目标仓位降至 {pct(float(base))}；否则保持 100%。"
+        )
+    if family == "trend_score":
+        return (
+            f"{freq_text}确认一次目标仓位；若收盘价在 MA{int(ma)} 之上且评分 < {float(high_score):.1f}，"
+            f"或评分 <= {float(low_score):.1f}，目标仓位为 100%；否则目标仓位为 {pct(float(base))}。"
+        )
+    if family == "trend_momentum":
+        return (
+            f"{freq_text}确认一次目标仓位；若收盘价在 MA{int(ma)} 之上且近 {int(ret_days)} 日涨幅 > {pct(float(ret_min))}，"
+            f"目标仓位为 100%；否则目标仓位为 {pct(float(base))}。"
+        )
+    if family == "trend_drawdown":
+        return (
+            f"{freq_text}确认一次目标仓位；若收盘价在 MA{int(ma)} 之上，或距三年高点回撤 <= {pct(float(drawdown_limit))}，"
+            f"目标仓位为 100%；否则目标仓位为 {pct(float(base))}。"
         )
     if family == "score_only":
         return (
@@ -779,11 +861,14 @@ def write_outputs(
 
 ## 策略搜索方法
 
-搜索范围包含三类可解释规则：
+搜索范围包含六类可解释规则：
 
 - 趋势 + 低分保护：站上均线或评分偏低时满仓，否则保留底仓。
 - 均线通道：站上均线上轨或评分偏低时满仓，跌破下轨且评分不低时降到底仓。
 - 高分风险控制：评分偏热且跌破长期均线时降仓。
+- 趋势 + 评分双确认：趋势向上且评分不过热，或评分处于较低区间时满仓，否则保留底仓。
+- 趋势 + 动量确认：趋势向上且中期涨幅为正时满仓，否则保留底仓。
+- 趋势 + 回撤修复：趋势向上或回撤已经较深时满仓，否则保留底仓。
 
 共同假设：只做多、不做空、不使用杠杆，目标仓位限制在 {pct(summary['min_position'])}-{pct(summary['max_position'])}，信号收盘后确认，下一交易日执行，仓位变化成本 {pct(cost)}。目标筛选要求：相对买入持有年化超额不少于 {pct(summary['min_excess_cagr'])}，最大回撤不差于 {pct(summary['max_acceptable_drawdown'])}，年均换手不超过 {num(summary['max_turnover_per_year'], 2)} 倍，仓位变化不超过 {summary['max_position_changes']} 次，并且验证期和 2022 年后样本年化收益为正。
 
