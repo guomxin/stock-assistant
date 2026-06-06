@@ -22,6 +22,11 @@ ANALYSIS_DIR = BASE_DIR / "analysis" / "nasdaq100"
 
 START_DATE = "20050101"
 DEFAULT_COST = 0.0005
+MAX_POSITION = 1.70
+MIN_EXCESS_CAGR = 0.05
+MAX_ACCEPTABLE_DRAWDOWN = -0.65
+MAX_TURNOVER_PER_YEAR = 2.0
+MAX_POSITION_CHANGES = 80
 TARGET = ("^NDX", "NDX.YAHOO", "纳斯达克100")
 BENCHMARKS = [
     ("^GSPC", "GSPC.YAHOO", "标普500"),
@@ -286,7 +291,7 @@ def years_between(dates: pd.Series) -> float:
 
 
 def metric(frame: pd.DataFrame, signal: np.ndarray, cost: float) -> Metric:
-    sig = pd.Series(signal, index=frame.index).ffill().fillna(1.0).clip(0.0, 1.0).to_numpy()
+    sig = pd.Series(signal, index=frame.index).ffill().fillna(1.0).clip(0.0, MAX_POSITION).to_numpy()
     pos = np.empty_like(sig, dtype=float)
     pos[0] = sig[0]
     pos[1:] = sig[:-1]
@@ -357,7 +362,7 @@ def generate_candidates(df: pd.DataFrame) -> list[tuple[str, np.ndarray, dict]]:
     score = df["score"]
 
     def add(name: str, raw: np.ndarray | pd.Series, meta: dict) -> None:
-        raw_array = pd.Series(raw, index=df.index).ffill().fillna(1.0).clip(0.0, 1.0).to_numpy()
+        raw_array = pd.Series(raw, index=df.index).ffill().fillna(1.0).clip(0.0, MAX_POSITION).to_numpy()
         candidates.append((name, raw_array, meta))
 
     add("buy_hold", np.ones(len(df)), {"family": "baseline"})
@@ -417,6 +422,35 @@ def generate_candidates(df: pd.DataFrame) -> list[tuple[str, np.ndarray, dict]]:
                         rebalance_signal(df, raw, freq),
                         {"family": "risk_off_high", "base": base, "ma": window, "high_score": high, "freq": freq},
                     )
+
+    # Higher-return index-signal rules.  These allow moderate superweighting
+    # but keep the search space simple: monthly/weekly confirmation, one MA,
+    # and a score guard to avoid adding leverage when the index is historically
+    # very hot.
+    for freq in ["weekly", "monthly"]:
+        for window in [150, 200, 250]:
+            ma = df[f"ma{window}"]
+            for full in [1.4, 1.5, 1.6, 1.7]:
+                for mid in [1.0, 1.1]:
+                    for risk in [0.7, 0.8]:
+                        for high in [7.5, 8.0]:
+                            low = 4.0
+                            raw = np.where((close > ma) & (score < high), full, mid)
+                            raw = np.where((close < ma) & (score > low), risk, raw)
+                            add(
+                                f"{freq}_scoretrend_full{full:.1f}_mid{mid:.1f}_risk{risk:.1f}_ma{window}_high{high:.1f}_low{low:.1f}",
+                                rebalance_signal(df, raw, freq),
+                                {
+                                    "family": "scoretrend",
+                                    "max_position": full,
+                                    "mid_position": mid,
+                                    "risk_position": risk,
+                                    "ma": window,
+                                    "high_score": high,
+                                    "low_score": low,
+                                    "freq": freq,
+                                },
+                            )
     return candidates
 
 
@@ -449,11 +483,14 @@ def research_strategies(scored: pd.DataFrame, cost: float) -> tuple[pd.DataFrame
         test = segment_metric(df, signal, "2022-01-01", None, use_cost)
         recent = segment_metric(df, signal, "2020-01-01", None, use_cost)
         mdd_improvement = full.max_drawdown - buyhold.max_drawdown
-        utility = full.cagr + 0.55 * mdd_improvement + 0.03 * full.sharpe - 0.002 * (full.turnover / full.years)
+        excess_cagr = full.cagr - buyhold.cagr
+        turnover_per_year = full.turnover / full.years
+        utility = full.cagr + 0.04 * full.sharpe + 0.02 * (full.max_drawdown - MAX_ACCEPTABLE_DRAWDOWN) - 0.002 * turnover_per_year
         row = {
             "name": name,
             **meta,
             "cagr": full.cagr,
+            "excess_cagr_vs_buyhold": excess_cagr,
             "total_return": full.total_return,
             "max_drawdown": full.max_drawdown,
             "mdd_improvement_vs_buyhold": mdd_improvement,
@@ -461,7 +498,7 @@ def research_strategies(scored: pd.DataFrame, cost: float) -> tuple[pd.DataFrame
             "sharpe": full.sharpe,
             "exposure": full.exposure,
             "turnover": full.turnover,
-            "turnover_per_year": full.turnover / full.years,
+            "turnover_per_year": turnover_per_year,
             "changes": full.changes,
             "utility": utility,
             **metric_row("train", train),
@@ -472,18 +509,36 @@ def research_strategies(scored: pd.DataFrame, cost: float) -> tuple[pd.DataFrame
         rows.append(row)
         signal_map[name] = signal
 
-    grid = pd.DataFrame(rows).sort_values("utility", ascending=False).reset_index(drop=True)
+    grid = pd.DataFrame(rows)
     robust = grid[
         (grid["name"] != "buy_hold")
-        & (grid["cagr"] >= buyhold.cagr - 0.015)
-        & (grid["mdd_improvement_vs_buyhold"] >= 0.04)
+        & (grid["excess_cagr_vs_buyhold"] >= MIN_EXCESS_CAGR)
+        & (grid["max_drawdown"] >= MAX_ACCEPTABLE_DRAWDOWN)
+        & (grid["turnover_per_year"] <= MAX_TURNOVER_PER_YEAR)
+        & (grid["changes"] <= MAX_POSITION_CHANGES)
         & (grid["test2022_cagr"] > 0)
         & (grid["valid_cagr"] > 0)
     ].copy()
-    selected = robust.iloc[0].to_dict() if not robust.empty else grid[grid["name"] != "buy_hold"].iloc[0].to_dict()
+    grid["selection_pass"] = grid["name"].isin(set(robust["name"]))
+    grid = grid.sort_values(
+        ["selection_pass", "cagr", "sharpe", "max_drawdown", "turnover_per_year"],
+        ascending=[False, False, False, False, True],
+    ).reset_index(drop=True)
+    if not robust.empty:
+        selected = robust.sort_values(
+            ["cagr", "sharpe", "max_drawdown", "turnover_per_year"],
+            ascending=[False, False, False, True],
+        ).iloc[0].to_dict()
+    else:
+        selected = grid[grid["name"] != "buy_hold"].iloc[0].to_dict()
     selected_signal = signal_map[str(selected["name"])]
     summary = {
         "cost": cost,
+        "max_position": MAX_POSITION,
+        "min_excess_cagr": MIN_EXCESS_CAGR,
+        "max_acceptable_drawdown": MAX_ACCEPTABLE_DRAWDOWN,
+        "max_turnover_per_year": MAX_TURNOVER_PER_YEAR,
+        "max_position_changes": MAX_POSITION_CHANGES,
         "buyhold": buyhold.__dict__,
         "selected": selected,
         "robust_candidates": int(len(robust)),
@@ -501,6 +556,9 @@ def describe_strategy(selected: dict) -> str:
     low_score = selected.get("low_score")
     band = selected.get("band")
     high_score = selected.get("high_score")
+    mid_position = selected.get("mid_position")
+    risk_position = selected.get("risk_position")
+    max_position = selected.get("max_position")
 
     if family == "band":
         return (
@@ -519,6 +577,14 @@ def describe_strategy(selected: dict) -> str:
             f"{freq_text}确认一次目标仓位；若评分 >= {float(high_score):.1f} 且收盘价低于 MA{int(ma)}，"
             f"目标仓位降至 {pct(float(base))}；否则保持 100%。"
         )
+    if family == "scoretrend":
+        return (
+            f"{freq_text}确认一次目标仓位；若收盘价在 MA{int(ma)} 之上且评分 < {float(high_score):.1f}，"
+            f"目标仓位提高到 {pct(float(max_position))}；"
+            f"若收盘价低于 MA{int(ma)} 且评分 > {float(low_score):.1f}，"
+            f"目标仓位降至 {pct(float(risk_position))}；"
+            f"其余情况维持 {pct(float(mid_position))}。"
+        )
     if family == "score_only":
         return (
             f"{freq_text}确认一次目标仓位；若评分低于 {float(high_score):.1f}，目标仓位为 100%；"
@@ -531,7 +597,7 @@ def build_nav(scored: pd.DataFrame, signal: np.ndarray, cost: float) -> pd.DataF
     df = scored.sort_values("trade_date").dropna(subset=["close", "score"]).reset_index(drop=True)
     df["date"] = pd.to_datetime(df["trade_date"])
     df["daily_ret"] = df["close"].pct_change().fillna(0.0)
-    df["target_position"] = pd.Series(signal, index=df.index).ffill().fillna(1.0).clip(0.0, 1.0)
+    df["target_position"] = pd.Series(signal, index=df.index).ffill().fillna(1.0).clip(0.0, MAX_POSITION)
     df["position"] = df["target_position"].shift(1).fillna(df["target_position"].iloc[0])
     df["turnover"] = (df["position"] - df["position"].shift(1).fillna(df["position"].iloc[0])).abs()
     df["strategy_ret"] = df["position"] * df["daily_ret"] - df["turnover"] * cost
@@ -580,6 +646,21 @@ def num(value: float | None, digits: int = 2) -> str:
     return f"{value:.{digits}f}"
 
 
+def json_ready(value):
+    if isinstance(value, dict):
+        return {str(k): json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_ready(v) for v in value]
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    return value
+
+
 def ymd(value: str) -> str:
     text = str(value)
     if len(text) == 8:
@@ -623,7 +704,7 @@ def write_outputs(
     grid.to_csv(ANALYSIS_DIR / "nasdaq100_strategy_research_grid.csv", index=False, encoding="utf-8-sig")
     nav.to_csv(ANALYSIS_DIR / "nasdaq100_recommended_strategy_nav.csv", index=False, encoding="utf-8-sig")
     (ANALYSIS_DIR / "nasdaq100_strategy_research_summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(json_ready(summary), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
     )
     latest_json = {
         "index_code": TARGET[1],
@@ -632,12 +713,18 @@ def write_outputs(
         "score": float(latest["score"]),
         "zone": zone(float(latest["score"])),
         "recommended_strategy": selected["name"],
+        "recommended_rule": selected_rule,
         "target_position": float(nav.iloc[-1]["target_position"]),
         "applied_position": float(nav.iloc[-1]["position"]),
+        "backtest_cagr": float(selected["cagr"]),
+        "backtest_excess_cagr_vs_buyhold": float(selected["excess_cagr_vs_buyhold"]),
+        "backtest_max_drawdown": float(selected["max_drawdown"]),
+        "turnover_per_year": float(selected["turnover_per_year"]),
+        "position_changes": int(selected["changes"]),
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     (ANALYSIS_DIR / "nasdaq100_latest_signal.json").write_text(
-        json.dumps(latest_json, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(json_ready(latest_json), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
     )
 
     buyhold = summary["buyhold"]
@@ -646,8 +733,10 @@ def write_outputs(
     top_grid["cagr_fmt"] = top_grid["cagr"].map(pct)
     top_grid["mdd_fmt"] = top_grid["max_drawdown"].map(pct)
     top_grid["mdd_improve_fmt"] = top_grid["mdd_improvement_vs_buyhold"].map(pct)
+    top_grid["excess_cagr_fmt"] = top_grid["excess_cagr_vs_buyhold"].map(pct)
     top_grid["test2022_cagr_fmt"] = top_grid["test2022_cagr"].map(pct)
     top_grid["exposure_fmt"] = top_grid["exposure"].map(pct)
+    top_grid["turnover_per_year_fmt"] = top_grid["turnover_per_year"].map(lambda x: num(x, 2))
 
     zone_fmt = zone_bt.copy()
     for col in ["win_rate", "avg_return", "median_return", "p10_return", "p90_return"]:
@@ -700,39 +789,44 @@ def write_outputs(
 
 ## 策略搜索方法
 
-搜索范围包含三类可解释规则：
+搜索范围包含四类可解释规则：
 
 - 趋势 + 低分保护：站上均线或评分偏低时满仓，否则保留底仓。
 - 均线通道：站上均线上轨或评分偏低时满仓，跌破下轨且评分不低时降到底仓。
 - 高分风险控制：评分偏热且跌破长期均线时降仓。
+- 评分 + 趋势增配：趋势向上且评分未到极热时提高到 140%-170%，趋势破位且评分不低时降至 70%-80%。
 
-共同假设：只做多、不加杠杆，信号收盘后确认，下一交易日执行，仓位变化成本 {pct(cost)}。
+共同假设：只做多，允许最高 {pct(summary['max_position'])} 指数目标仓位，信号收盘后确认，下一交易日执行，仓位变化成本 {pct(cost)}。稳健筛选要求：相对买入持有年化超额不少于 {pct(summary['min_excess_cagr'])}，最大回撤不差于 {pct(summary['max_acceptable_drawdown'])}，年均换手不超过 {num(summary['max_turnover_per_year'], 2)} 倍，仓位变化不超过 {summary['max_position_changes']} 次，并且验证期和 2022 年后样本年化收益为正。
 
 ## 推荐策略回测
 
 - 策略名称：`{selected['name']}`
 - 策略规则：{selected_rule}
+- 策略回测区间：{ymd(str(nav.iloc[0]['trade_date']))} 至 {ymd(str(nav.iloc[-1]['trade_date']))}
 - 候选策略数：{summary['total_candidates']}
 - 稳健筛选通过数量：{summary['robust_candidates']}
 - 策略年化收益：{pct(strategy_metric['cagr'])}
 - 买入持有年化收益：{pct(buyhold['cagr'])}
+- 策略年化超额：{pct(strategy_metric['cagr'] - buyhold['cagr'])}
 - 策略累计收益：{pct(strategy_metric['total_return'])}
 - 买入持有累计收益：{pct(buyhold['total_return'])}
 - 策略最大回撤：{pct(strategy_metric['max_drawdown'])}
 - 买入持有最大回撤：{pct(buyhold['max_drawdown'])}
 - 策略年化波动：{pct(strategy_metric['annual_vol'])}
 - 买入持有年化波动：{pct(buyhold['annual_vol'])}
+- 最高目标仓位：{pct(float(nav['target_position'].max()))}
 - 平均仓位：{pct(strategy_metric['exposure'])}
 - 仓位变化：{int(strategy_metric['changes'])} 次
 - 年均换手：{num(strategy_metric['turnover'] / strategy_metric['years'], 2)} 倍目标资金
+- 样本外验证：2016-2021 年化 {pct(float(selected['valid_cagr']))}，2022 年后年化 {pct(float(selected['test2022_cagr']))}
 
 ## 候选策略前十五
 
-{markdown_table(top_grid, ['name', 'cagr_fmt', 'mdd_fmt', 'mdd_improve_fmt', 'test2022_cagr_fmt', 'exposure_fmt', 'changes'])}
+{markdown_table(top_grid, ['name', 'cagr_fmt', 'excess_cagr_fmt', 'mdd_fmt', 'mdd_improve_fmt', 'test2022_cagr_fmt', 'exposure_fmt', 'turnover_per_year_fmt', 'changes'])}
 
 ## 使用提醒
 
-纳斯达克100是长期高成长、高波动资产。历史上很多降仓策略会显著降低回撤，但也可能牺牲牛市收益。这里的推荐策略更适合作为“目标仓位提示”，不适合机械预测短期涨跌。若用 QQQ 或境内纳指ETF执行，还需要额外考虑汇率、交易时间差、溢价率、费率和税务。
+纳斯达克100是长期高成长、高波动资产。为了达到相对买入持有年化超额 5 个百分点以上，当前推荐规则使用了最高 170% 的指数目标仓位，因此它不是低风险择时策略：历史年化收益更高，但最大回撤和年化波动也高于买入持有。这里的结果更适合作为“目标仓位提示”，不适合机械预测短期涨跌。若用 QQQ、期货、融资或境内纳指ETF执行，还需要额外考虑利息成本、汇率、交易时间差、溢价率、费率和税务。
 """
     report_path = ANALYSIS_DIR / "nasdaq100_strategy_report.md"
     report_path.write_text(report, encoding="utf-8")
