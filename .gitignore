@@ -30,6 +30,7 @@ analysis/h30269/*.json
 analysis/h30269/*.md
 analysis/h30269/daily_close_reports/
 analysis/h30269/xueqiu_posts/
+analysis/nasdaq100/
 
 # Keep source-facing project documents tracked
 !CODEX_HANDOFF.md

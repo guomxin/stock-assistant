@@ -82,6 +82,7 @@ python-dotenv>=1.0
 - `scripts/fetch_hk_roe_pe.py`：港股 ROE/PE 因子抓取。
 - `scripts/run_h30269_action_report.sh`：H30269 定时任务主入口。
 - `scripts/fetch_nasdaq100.py`：从 Yahoo Finance 抓取纳斯达克100指数 `^NDX` 日线，缓存为 `data/raw/index_daily/NDX_YAHOO_*.parquet`。
+- `scripts/analyze_nasdaq100_strategy.py`：基于 Yahoo `^NDX` 日线生成纳斯达克100评分、评分区间回测和行动策略研究报告。
 - `scripts/analyze_h30269.py`：H30269 评分分析。
 - `scripts/apply_h30269_intraday.py`：盘中估算覆盖。
 - `scripts/backtest_h30269_recommended_strategy.py`：推荐策略回测。

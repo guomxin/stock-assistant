@@ -9,6 +9,7 @@
 - 查询服务：`scripts/query_server.py`
 - H30269 主任务：`scripts/run_h30269_action_report.sh`
 - 纳斯达克100数据抓取：`scripts/fetch_nasdaq100.py`
+- 纳斯达克100评分与策略研究：`scripts/analyze_nasdaq100_strategy.py`
 - 只读巡检：`scripts/smoke_check.sh`
 - 关键数据备份：`scripts/run_backup.sh`
 - 维护 cron 安装：`scripts/install_maintenance_cron.sh`
