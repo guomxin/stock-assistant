@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parents[1]
 RAW_INDEX_DIR = BASE_DIR / "data" / "raw" / "index_daily"
 ANALYSIS_DIR = BASE_DIR / "analysis" / "kcb50"
+PRODUCTION_STRATEGY_PATH = BASE_DIR / "config" / "kcb50_production_strategy.json"
 
 TARGET = "000688.SH"
 TARGET_NAME = "科创50"
@@ -495,6 +496,54 @@ def target_pass(row: dict) -> bool:
     )
 
 
+def failed_target_constraints(row: dict) -> list[str]:
+    failures = []
+    if not row["cagr"] >= MIN_TARGET_CAGR:
+        failures.append(f"全样本年化 {pct(row['cagr'])} 低于 {pct(MIN_TARGET_CAGR)}")
+    if not row["max_drawdown"] >= MAX_ACCEPTABLE_DRAWDOWN:
+        failures.append(f"最大回撤 {pct(row['max_drawdown'])} 差于 {pct(MAX_ACCEPTABLE_DRAWDOWN)}")
+    if not row["turnover_per_year"] <= MAX_TURNOVER_PER_YEAR:
+        failures.append(f"年均换手 {num(row['turnover_per_year'], 2)} 超过 {num(MAX_TURNOVER_PER_YEAR, 1)}")
+    if not row["changes_per_year"] <= MAX_CHANGES_PER_YEAR:
+        failures.append(f"年均仓位变化 {num(row['changes_per_year'], 2)} 超过 {num(MAX_CHANGES_PER_YEAR, 1)}")
+    if not row["valid_cagr"] > 0:
+        failures.append(f"2022-2023 年化 {pct(row['valid_cagr'])} 不为正")
+    if not row["test_cagr"] > 0:
+        failures.append(f"2024 至今年化 {pct(row['test_cagr'])} 不为正")
+    return failures
+
+
+def load_production_strategy() -> dict | None:
+    if not PRODUCTION_STRATEGY_PATH.exists():
+        return None
+    config = json.loads(PRODUCTION_STRATEGY_PATH.read_text(encoding="utf-8"))
+    if not str(config.get("strategy_name", "")).strip():
+        raise SystemExit(f"Invalid production strategy config (missing strategy_name): {PRODUCTION_STRATEGY_PATH}")
+    return config
+
+
+def apply_production_strategy(grid: pd.DataFrame, summary: dict) -> dict:
+    """Pin the live signal to the strategy in config; daily grid search stays research-only."""
+    summary["research_top_name"] = summary["selected_name"]
+    summary["research_top"] = summary["selected"]
+    summary["selection_mode"] = "auto"
+    config = load_production_strategy()
+    if config is None:
+        return summary
+    name = str(config["strategy_name"]).strip()
+    match = grid[grid["name"] == name]
+    if match.empty:
+        summary["production_missing_name"] = name
+        print(f"WARNING: pinned production strategy not in candidate grid: {name}; fallback to research top.")
+        return summary
+    summary["selection_mode"] = "pinned"
+    summary["selected_name"] = name
+    summary["selected"] = match.iloc[0].to_dict()
+    summary["production_pinned_date"] = config.get("pinned_date")
+    summary["production_reason"] = config.get("reason")
+    return summary
+
+
 def research_strategies(scored: pd.DataFrame, cost: float, cash_return: float) -> tuple[pd.DataFrame, dict, np.ndarray]:
     df = scored.sort_values("trade_date").dropna(subset=["close", "score"]).reset_index(drop=True)
     df["date"] = pd.to_datetime(df["trade_date"])
@@ -703,6 +752,32 @@ def write_outputs(
         data_note = f"实时行情 {intraday_meta.get('quote_date', '')} {intraday_meta.get('quote_time', '')}".strip()
     execution_note = f"该目标由 {ymd(str(latest['trade_date']))} 信号给出，按下一交易日再平衡执行。"
 
+    selection_mode = summary.get("selection_mode", "auto")
+    research_top_name = summary.get("research_top_name", summary["selected_name"])
+    if selection_mode == "pinned":
+        pinned_date = summary.get("production_pinned_date") or "-"
+        selection_lines = (
+            f"- 生产策略（固定于 {pinned_date}，配置见 `config/kcb50_production_strategy.json`）："
+            f"`{summary['selected_name']}`"
+        )
+        if research_top_name == summary["selected_name"]:
+            selection_lines += "\n- 今日海选第一名与生产策略一致。"
+        else:
+            selection_lines += f"\n- 今日海选第一名（仅研究参考，不驱动仓位）：`{research_top_name}`"
+    else:
+        selection_lines = f"- 推荐策略（自动海选，未固定生产策略）：`{summary['selected_name']}`"
+    missing_name = summary.get("production_missing_name")
+    if missing_name:
+        selection_lines += (
+            f"\n- ⚠️ 固定的生产策略 `{missing_name}` 不在候选集中，本次退回自动海选结果，请尽快修复配置。"
+        )
+    target_failures = failed_target_constraints(selected)
+    if target_failures:
+        selection_lines += (
+            "\n- ⚠️ 生产策略当前不满足筛选目标：" + "；".join(target_failures) + "。"
+            "脚本不会自动切换策略，请人工评估是否调整固定配置。"
+        )
+
     scored.to_csv(ANALYSIS_DIR / "kcb50_score_history.csv", index=False, encoding="utf-8-sig")
     components.to_csv(ANALYSIS_DIR / "kcb50_score_components_latest.csv", index=False, encoding="utf-8-sig")
     zone_bt.to_csv(ANALYSIS_DIR / "kcb50_score_zone_backtest.csv", index=False, encoding="utf-8-sig")
@@ -748,6 +823,9 @@ def write_outputs(
         "score": float(latest["score"]),
         "zone": zone(float(latest["score"])),
         "recommended_strategy": summary["selected_name"],
+        "selection_mode": selection_mode,
+        "production_pinned_date": summary.get("production_pinned_date"),
+        "research_top_strategy": research_top_name,
         "target_position": target_position,
         "action": action,
         "execution_note": execution_note,
@@ -831,7 +909,7 @@ def write_outputs(
 - 最新点位：{num(float(latest['close']), 2)}
 - 数据口径：{data_note}
 - 当前评分：**{num(float(latest['score']), 2)} / 10**，{zone(float(latest['score']))}
-- 推荐策略：`{summary['selected_name']}`
+{selection_lines}
 - 当前策略目标仓位：**{pct(target_position)}**
 - 当前提示：**{action}**
 - 执行口径：{execution_note}
@@ -851,7 +929,7 @@ def write_outputs(
 - 目标：策略全样本年化收益不低于 {pct(MIN_TARGET_CAGR)}，最大回撤不差于 {pct(MAX_ACCEPTABLE_DRAWDOWN)}，年均换手不超过 {num(MAX_TURNOVER_PER_YEAR, 1)} 倍，年均仓位变化不超过 {num(MAX_CHANGES_PER_YEAR, 1)} 次，且 2022-2023 与 2024 至今收益为正。
 - 候选策略：{summary['candidate_count']} 个；达标：{summary['target_pass_count']} 个。
 
-## 推荐行动策略
+## {"生产行动策略" if selection_mode == "pinned" else "推荐行动策略"}
 
 - 规则：{strategy_rule}
 - 策略年化收益：{pct(float(selected['cagr']))}
@@ -890,7 +968,7 @@ def write_outputs(
 
 ## 使用提醒
 
-科创50历史样本从 2019 年底开始，回测区间明显短于红利低波，达标策略更依赖 2021 年后大回撤期间的风险规避效果。该策略在 0.10% 成本、空仓现金年化 2.00% 口径下刚超过 15%；若空仓现金收益为 0 或交易成本明显更高，则不再达标。该报告适合作为仓位管理研究，不应理解为收益保证。
+科创50历史样本从 2019 年底开始，回测区间明显短于红利低波，候选策略对样本期高度敏感：每日重新海选的第一名会随新数据漂移，因此生产信号固定在 `config/kcb50_production_strategy.json` 指定的策略上，海选结果只作研究参考；若生产策略持续不达标，报告会告警但不会自动切换，需人工评估后修改配置。该报告适合作为仓位管理研究，不应理解为收益保证。
 """
     report_path = ANALYSIS_DIR / "kcb50_strategy_report.md"
     report_path.write_text(report, encoding="utf-8")
@@ -926,6 +1004,9 @@ def main() -> int:
     official_scored, _official_components = add_score(official_indicators)
     official_scored = add_forward_returns(official_scored, [60, 120, 250])
     grid, summary, selected_signal = research_strategies(official_scored, args.cost, args.cash_return)
+    summary = apply_production_strategy(grid, summary)
+    if summary["selection_mode"] == "pinned":
+        selected_signal = signal_for_strategy(official_scored, summary["selected_name"])
 
     intraday_meta = None
     if args.intraday:
@@ -946,9 +1027,14 @@ def main() -> int:
     print(f"Latest date: {latest['trade_date']}; score={latest['score']:.2f}/10")
     print(f"Candidates: {summary['candidate_count']}; target pass: {summary['target_pass_count']}")
     print(
-        f"Selected: {summary['selected_name']}; CAGR={selected['cagr']:.4%}; "
+        f"Selected ({summary['selection_mode']}): {summary['selected_name']}; CAGR={selected['cagr']:.4%}; "
         f"buyhold={summary['benchmark']['cagr']:.4%}; MDD={selected['max_drawdown']:.4%}"
     )
+    if summary.get("research_top_name") != summary["selected_name"]:
+        print(f"Research top (reference only): {summary['research_top_name']}")
+    production_failures = failed_target_constraints(selected)
+    if production_failures:
+        print(f"WARNING: production strategy misses targets: {'; '.join(production_failures)}")
     print(f"Target position: {nav.iloc[-1]['target_position']:.2%}")
     return 0
 
