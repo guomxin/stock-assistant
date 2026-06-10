@@ -30,8 +30,14 @@ analysis/h30269/*.json
 analysis/h30269/*.md
 analysis/h30269/daily_close_reports/
 analysis/h30269/xueqiu_posts/
+analysis/h30269/robust_research/*.csv
+analysis/h30269/robust_research/*.json
 analysis/nasdaq100/
 analysis/kcb50/
+
+# Hand-written research and review documents stay tracked
+!analysis/h30269/h30269_strategy_review_*.md
+!analysis/h30269/robust_research/*.md
 
 # Keep source-facing project documents tracked
 !CODEX_HANDOFF.md
