@@ -2,7 +2,7 @@
 
 项目目录：`/mnt/ssd01/stocks`  
 主要依据：`CODEX_LOCAL_KNOWLEDGE.md`  
-当前日期：2026-06-05
+当前日期：2026-06-10
 
 ## 基本原则
 
@@ -41,6 +41,7 @@ scripts/stop_query_server.sh
 - A 股：`http://127.0.0.1:8088/`
 - 港股：`http://127.0.0.1:8088/hk`
 - H30269：`http://127.0.0.1:8088/h30269`
+- 科创50：`http://127.0.0.1:8088/kcb50`
 - 健康检查：`http://127.0.0.1:8088/health`
 
 ## 数据抓取
@@ -106,6 +107,12 @@ cd /mnt/ssd01/stocks
 H30269_OFFICIAL_DAILY_MAX_ATTEMPTS=1 scripts/run_h30269_action_report.sh afternoon-close
 ```
 
+策略口径：
+
+- 点位、评分和 MA 信号使用价格指数 `H30269.CSI`。
+- 策略收益和持有不动收益使用全收益指数 `h20269.CSI`（含股息再投资）；盘中估算或全收益未发布日用价格收益顺延。
+- 2026-06 防过拟合复检见 `analysis/h30269/h30269_strategy_review_20260610.md` 和 `analysis/h30269/robust_research/`。当前结论是策略家族有效，但 2019 年以来更偏回撤控制，不应把近期收益增强说得过满。
+
 ## 科创50
 
 网页：
@@ -131,7 +138,7 @@ scripts/install_kcb50_cron.sh
 
 默认 cron：
 
-- 11:35 刷新最新可得官方日线并更新 `/kcb50`。
+- 11:35 使用 Tushare 实时指数行情生成当天中午报告并归档；生产策略仍固定，不用盘中数据重新海选。
 - 18:30 等待 Tushare 当天 `000688.SH` 官方日线，生成 `/kcb50` 并归档收盘报告。
 - 科创50任务不发雪球。
 
@@ -141,6 +148,7 @@ scripts/install_kcb50_cron.sh
 - 若生产策略不满足筛选目标，报告会输出 ⚠️ 告警但不会自动切换。
 - 换策略：人工评估后修改该文件的 `strategy_name`，并更新 `pinned_date` 和 `reason`。
 - 该文件缺失时退回每日自动海选（会重新出现选中策略漂移），不要随意删除。
+- 防过拟合复检见 `analysis/kcb50/robust_research/kcb50_robust_strategy_research.md`；当前结论是持续重选策略不创造价值，固定生产策略可维持，但 2022-2023 分段为负需持续关注。
 
 ## 雪球
 
@@ -161,7 +169,7 @@ scripts/post_xueqiu_status.py \
 ```bash
 cd /mnt/ssd01/stocks
 source .venv/bin/activate
-scripts/xueqiu_waf_refresh.py --write-env
+.venv/bin/python scripts/xueqiu_waf_refresh.py --write-env
 ```
 
 ## 定时任务
@@ -180,6 +188,8 @@ crontab -l
 - 10:00 H30269 盘中报告
 - 11:35 H30269 中午报告并发雪球
 - 18:30 H30269 收盘报告并发雪球
+- 11:35 科创50中午报告
+- 18:30 科创50收盘报告
 - 09:15 和 19:50 只读巡检
 - 22:30 关键数据备份
 

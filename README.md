@@ -1,6 +1,6 @@
-# 股票因子与红利低波报告
+# 股票因子、红利低波与科创50报告
 
-这个项目用于维护 A 股、港股 ROE/PE 因子查询页，并生成红利低波指数 `H30269.CSI` 的行动报告和雪球发布文案。
+这个项目用于维护 A 股、港股 ROE/PE 因子查询页，并生成红利低波指数 `H30269.CSI`、科创50 `000688.SH` 的行动报告；红利低波报告会生成并发布雪球文案。
 
 当前本机维护入口：
 
@@ -10,8 +10,10 @@
 - H30269 主任务：`scripts/run_h30269_action_report.sh`
 - H30269 评分生成：`scripts/analyze_h30269.py`
 - H30269 策略研究：`scripts/research_h30269_strategy.py`
+- H30269 防过拟合研究：`scripts/research_h30269_robust.py`、`scripts/research_h30269_expanded.py`
 - H30269 推荐策略回测：`scripts/backtest_h30269_recommended_strategy.py`
 - 科创50评分与策略研究：`scripts/analyze_kcb50_strategy.py`
+- 科创50防过拟合研究：`scripts/research_kcb50_robust.py`
 - 科创50定时刷新：`scripts/run_kcb50_action_report.sh`
 - 纳斯达克100数据抓取：`scripts/fetch_nasdaq100.py`
 - 纳斯达克100评分与策略研究：`scripts/analyze_nasdaq100_strategy.py`
@@ -40,5 +42,7 @@ scripts/smoke_check.sh
 
 - `.env` 保存 Tushare 和雪球生产凭据，不要打印、提交或同步到不可信位置。
 - `morning-close` 和 `afternoon-close` H30269 任务会真实发雪球。
+- H30269 策略收益和持有不动收益使用全收益指数 `h20269.CSI` 口径；点位、评分和 MA 信号仍使用价格指数 `H30269.CSI`。
+- 科创50仓位由 `config/kcb50_production_strategy.json` 固定生产策略驱动，每日海选只作研究参考。
 - 当前目录已经初始化为 git 仓库，默认分支为 `main`。生产数据和凭据由 `.gitignore` 保护。
 - 本机备份默认写入 `backups/`，归档内包含 `.env`，目录权限应保持仅当前用户可读写。

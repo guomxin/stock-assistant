@@ -1,6 +1,6 @@
 # Codex 本机接手知识库
 
-更新时间：2026-06-05 12:57 CST  
+更新时间：2026-06-10 17:20 CST
 项目根目录：`/mnt/ssd01/stocks`  
 主机名：`xingm-AI`  
 本机局域网 IP：`192.168.0.16`，同时存在 docker/虚拟网卡地址。  
@@ -83,13 +83,15 @@ python-dotenv>=1.0
 - `scripts/run_h30269_action_report.sh`：H30269 定时任务主入口。
 - `scripts/fetch_nasdaq100.py`：从 Yahoo Finance 抓取纳斯达克100指数 `^NDX` 日线，缓存为 `data/raw/index_daily/NDX_YAHOO_*.parquet`。
 - `scripts/analyze_nasdaq100_strategy.py`：基于 Yahoo `^NDX` 日线生成纳斯达克100评分、评分区间回测和行动策略研究报告。
-- `scripts/analyze_kcb50_strategy.py`：基于 Tushare `000688.SH` 日线生成科创50评分、评分区间回测和行动策略研究报告。
+- `scripts/analyze_kcb50_strategy.py`：基于 Tushare `000688.SH` 日线/实时行情生成科创50评分、评分区间回测和行动策略研究报告。
 - `scripts/run_kcb50_action_report.sh`：科创50中午/下午收盘刷新入口。
 - `scripts/install_kcb50_cron.sh`：安装科创50中午/下午收盘刷新 cron。
 - `scripts/analyze_h30269.py`：H30269 评分分析。
 - `scripts/apply_h30269_intraday.py`：盘中估算覆盖。
 - `scripts/backtest_h30269_recommended_strategy.py`：推荐策略回测。
 - `scripts/build_h30269_combined_report.py`：用户可读行动报告。
+- `scripts/research_h30269_robust.py`、`scripts/research_h30269_expanded.py`：H30269 全收益口径防过拟合复检。
+- `scripts/research_kcb50_robust.py`：科创50 IS/OOS、walk-forward 和参数平台复检。
 - `scripts/build_h30269_xueqiu_post.py`：生成雪球文案。
 - `scripts/post_xueqiu_status.py`：雪球 HTTP 发帖。
 - `scripts/xueqiu_waf_refresh.py`：雪球 WAF/Cookie 刷新。
@@ -296,19 +298,19 @@ H30269_OFFICIAL_DAILY_SLEEP_SECONDS=300
 
 当前 H30269 最新状态：
 
-- 最新生成时间：2026-06-06 11:44。
+- 最新生成时间：2026-06-10 16:45。
 - 最新报告：`analysis/h30269/h30269_combined_report.md`。
 - 盘中评分报告：`analysis/h30269/h30269_score_report_latest.md`。
 - 推荐策略报告：`analysis/h30269/h30269_recommended_strategy_report.md`。
-- 最新交易日：2026-06-05。
-- 当前评分：2.74 / 10。
+- 最新交易日：2026-06-10。
+- 当前评分：3.10 / 10。
 - 下一交易日目标仓位：100.00%。
-- 当前不是月度确认日；如果当日确认，也会因评分低于 4.0 维持 100%。
+- 当前不是月度确认日；评分低于 4.0 且站上 MA24，按推荐规则维持 100%。
 
 H30269 归档：
 
-- 已有收盘归档：20260601、20260602、20260603、20260604、20260605。
-- 已有雪球文案：20260603 morning/afternoon、20260604 morning/afternoon、20260605 morning/afternoon。
+- 已有收盘归档：至少 20260601 至 20260610。
+- 已有雪球文案：至少 20260603 至 20260610 的 morning/afternoon；20260610 morning-close 曾因 Cookie 失效失败，重新登录后已补发成功。
 
 ## 9. H30269 策略口径
 
@@ -330,25 +332,33 @@ H30269 归档：
 
 - 历史评分使用截至当日可见的扩展分位，至少 252 个有效样本后才出分，避免未来函数。
 - 月度信号收盘后确认，下一交易日生效。
+- 点位、评分和 MA 信号使用价格指数 `H30269.CSI`。
+- 策略收益和持有不动收益使用红利低波全收益指数 `h20269.CSI`（含股息再投资）；盘中估算或全收益当日未发布时用价格收益顺延补缺口。
 - 默认扣除 0.10% 的仓位变动成本。
-- 空仓资金默认按现金管理年化 2.00% 计入；若空仓现金收益按 0 计算，本策略年化超额低于 5%。
+- 空仓资金默认按现金管理年化 2.00% 计入；全收益口径下空仓的机会成本更高，不能再用价格指数低估持有不动收益。
 - 必须同时看策略年化、持有年化、年化超额、累计收益、最大回撤、分段表现、换手、成本敏感性和现金收益敏感性。
 
-2026-06-06 11:44 报告中的全样本结果：
+2026-06-10 16:45 报告中的全收益口径全样本结果：
 
 ```text
-样本区间：20080125 至 20260605
-策略年化收益：8.67%
-持有不动年化收益：3.51%
-年化超额：5.16%
-策略累计收益：360.13%
-持有不动累计收益：88.24%
-策略最大回撤：-57.81%
-持有不动最大回撤：-64.60%
-平均仓位：77.73%
+样本区间：20080125 至 20260610
+策略年化收益：11.72%
+持有不动年化收益：7.54%
+年化超额：4.18%
+策略累计收益：665.98%
+持有不动累计收益：280.30%
+策略最大回撤：-57.11%
+持有不动最大回撤：-63.94%
+平均仓位：77.75%
 仓位变化：68 次，约 3.7 次/年
 年均换手：3.7 倍目标资金
 ```
+
+2026-06 H30269 防过拟合结论：
+
+- 详见 `analysis/h30269/h30269_strategy_review_20260610.md`、`analysis/h30269/robust_research/h30269_robust_strategy_research.md`、`analysis/h30269/robust_research/h30269_expanded_research.md`。
+- 原生产策略家族（月度趋势 + 低分保护）在全收益口径下是可实时发现的平台，不是孤峰；扩展更多教科书策略后没有找到更可靠的新策略。
+- 但 2019 年以来超额消失，策略角色更偏回撤控制和极端行情保护，不应把近年收益增强说得过满。
 
 ## 10. 科创50 策略研究
 
@@ -376,15 +386,15 @@ scripts/install_kcb50_cron.sh
 
 默认 cron：
 
-- 11:35 `morning-close`：刷新最新可得官方日线并更新网页报告。
+- 11:35 `morning-close`：使用 Tushare 实时指数行情生成当天中午报告并归档；生产策略固定，不用盘中数据重新海选。
 - 18:30 `afternoon-close`：等待 Tushare 当天 `000688.SH` 官方日线，生成网页报告并归档到 `analysis/kcb50/daily_close_reports/`。
 - 科创50任务不发雪球。
 
 数据：
 
 - 指数代码：`000688.SH`，科创50。
-- 数据源：Tushare `index_daily`。
-- 缓存：`data/raw/index_daily/000688_SH_20191231_20260607.parquet`。
+- 数据源：Tushare `index_daily`；`morning-close` 额外使用 `realtime_quote` 生成当天盘中/中午报告。
+- 缓存：`data/raw/index_daily/` 下的 `000688_SH_20191231_*.parquet` 等文件，文件名随最新 end_date 变化。
 - 基准：`000300.SH` 沪深300、`399006.SZ` 创业板指。
 - 输出目录：`analysis/kcb50/`。
 
@@ -424,6 +434,13 @@ scripts/install_kcb50_cron.sh
 - 样本期短（2019 年底起），达标线（全样本年化 >= 15% 且各分段为正）对候选高度敏感；2026-06-09 起 14983 个候选中达标数为 0。
 - 选择月度均线带的理由：参数邻域（ma30/base0.1/low3.5）均排进前 10，属于平台而非孤峰；月度确认 + 迟滞带换手低；与 2026-06-08 起的线上报告连续。
 - 已知缺口是 2022-2023 分段为负；若该缺口长期存在或明显跑输研究第一名，应人工重新评估固定配置。
+
+2026-06 科创50防过拟合结论：
+
+- 详见 `analysis/kcb50/robust_research/kcb50_robust_strategy_research.md`（注意 `analysis/kcb50/` 整体被 gitignore，默认不跟踪）。
+- IS 年化排名与 OOS 年化排名 Spearman 约 -0.028，回测排名对未来表现几乎没有预测力。
+- 持续重选第一名的 walk-forward 年化大约 2%-6%，不创造稳定价值；固定生产策略可维持，但这是人工风险偏好的固定选择，不是统计显著的“更强策略”。
+- 防守型备选是 `weekly_pure_momentum_base0.00_ret15_th0.04`，2022-2023 更稳、回撤更小，但全样本盈利能力低于生产策略；是否切换属于人工决策。
 
 ## 11. 雪球发帖
 
@@ -486,6 +503,7 @@ scripts/post_xueqiu_status.py \
 - 2026-06-04 morning-close：HTTP 发帖成功。
 - 2026-06-04 afternoon-close：HTTP 发帖成功。
 - 2026-06-05 morning-close：HTTP 发帖成功。
+- 2026-06-10 morning-close：曾因 `400016` Cookie 失效失败；用户在临时 Chrome 登录后已更新 `.env` 的 `XUEQIU_COOKIE_B64`，`validate-only` 返回 200，并已补发成功（雪球返回 ID `393977733`）。
 - 2026-06-03 曾出现 `400019`，后续已通过正确 session token 流程解决。
 
 ## 12. 定时任务
@@ -502,6 +520,8 @@ scripts/post_xueqiu_status.py \
 15 9 * * 1-5 cd /mnt/ssd01/stocks && /mnt/ssd01/stocks/scripts/smoke_check.sh >> /mnt/ssd01/stocks/logs/smoke_check.log 2>&1 # stocks-smoke-check
 50 19 * * 1-5 cd /mnt/ssd01/stocks && /mnt/ssd01/stocks/scripts/smoke_check.sh >> /mnt/ssd01/stocks/logs/smoke_check.log 2>&1 # stocks-smoke-check
 30 22 * * 1-5 cd /mnt/ssd01/stocks && /mnt/ssd01/stocks/scripts/run_backup.sh >> /mnt/ssd01/stocks/logs/backup.log 2>&1 # stocks-backup
+35 11 * * 1-5 cd /mnt/ssd01/stocks && /mnt/ssd01/stocks/scripts/run_kcb50_action_report.sh morning-close >> /mnt/ssd01/stocks/logs/kcb50_action_report.log 2>&1 # kcb50-action-report
+30 18 * * 1-5 cd /mnt/ssd01/stocks && /mnt/ssd01/stocks/scripts/run_kcb50_action_report.sh afternoon-close >> /mnt/ssd01/stocks/logs/kcb50_action_report.log 2>&1 # kcb50-action-report
 ```
 
 时间区：本机 `date` 显示 `CST +0800`。这些 cron 时间按本机时区执行。
@@ -609,7 +629,7 @@ H30269 收盘日期不对：
    ```bash
    cd /mnt/ssd01/stocks
    source .venv/bin/activate
-   scripts/xueqiu_waf_refresh.py --write-env
+   .venv/bin/python scripts/xueqiu_waf_refresh.py --write-env
    ```
 
 4. 再用 `post_xueqiu_status.py --validate-only` 验证。
