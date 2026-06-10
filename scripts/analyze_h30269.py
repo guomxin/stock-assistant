@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import os
@@ -30,6 +31,7 @@ BENCHMARKS = {
     "000922.CSI": "中证红利",
 }
 START_DATE = "20051230"
+MIN_SCORE_OBSERVATIONS = 252
 
 
 @dataclass(frozen=True)
@@ -145,8 +147,20 @@ def rolling_percentile_last(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window, min_periods=max(60, window // 3)).apply(calc, raw=True)
 
 
-def historical_percentile(series: pd.Series) -> pd.Series:
-    return series.rank(pct=True)
+def expanding_percentile(series: pd.Series, min_periods: int = MIN_SCORE_OBSERVATIONS) -> pd.Series:
+    values: list[float] = []
+    out = np.full(len(series), np.nan, dtype=float)
+    for i, value in enumerate(series.to_numpy(dtype=float)):
+        if not np.isfinite(value):
+            continue
+        bisect.insort(values, float(value))
+        if len(values) < min_periods:
+            continue
+        left = bisect.bisect_left(values, float(value))
+        right = bisect.bisect_right(values, float(value))
+        average_rank = (left + 1 + right) / 2
+        out[i] = average_rank / len(values)
+    return pd.Series(out, index=series.index)
 
 
 def build_indicator_frame(target: pd.DataFrame, benchmarks: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -185,7 +199,7 @@ def add_score(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     scored = df.copy()
     rows = []
     for spec in COMPONENTS:
-        pct = historical_percentile(scored[spec.key])
+        pct = expanding_percentile(scored[spec.key])
         scored[f"{spec.key}_score"] = pct * 10
         scored[f"{spec.key}_contribution"] = scored[f"{spec.key}_score"] * spec.weight
 
@@ -402,7 +416,7 @@ def write_report(
 - 当前评分：**{num(latest_score, 2)} / 10**
 - 当前区间：**{latest_zone}**
 
-评分含义：0 分附近代表历史上偏低、偏冷、偏回撤的位置；10 分附近代表历史上偏高、偏热、偏拥挤的位置。分数越低越偏买入观察，分数越高越偏卖出或降低仓位观察。
+评分含义：0 分附近代表历史上偏低、偏冷、偏回撤的位置；10 分附近代表历史上偏高、偏热、偏拥挤的位置。分数越低越偏买入观察，分数越高越偏卖出或降低仓位观察。历史回测中的分位只使用截至当日可见的数据，至少 {MIN_SCORE_OBSERVATIONS} 个有效样本后才出分，避免未来样本影响过去评分。
 
 ## 指数长期表现
 
@@ -418,7 +432,7 @@ def write_report(
 
 ## 评分函数
 
-总分 = 各指标子分 × 权重后求和。每个子分先转换为历史分位，0 表示历史偏低，10 表示历史偏高。
+总分 = 各指标子分 × 权重后求和。每个子分先转换为截至当日可见的历史分位，0 表示历史偏低，10 表示历史偏高。
 
 {markdown_table(
         component_latest.assign(

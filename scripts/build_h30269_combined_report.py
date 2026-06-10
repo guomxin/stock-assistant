@@ -72,23 +72,24 @@ def score_zone(score: float) -> str:
 
 
 def reason_text(signal: dict) -> str:
-    if signal["low_score_trigger"]:
-        return "低分保护成立：评分 <= 4.0，按推荐规则维持满仓。"
-    if signal["trend_enter_trigger"]:
-        return "趋势上轨成立：收盘价突破 MA15 上轨，按推荐规则维持或切换到满仓。"
-    if signal["base_exit_trigger"]:
-        return "降仓条件成立：评分 > 4.0 且收盘价跌破 MA15 下轨，按推荐规则降到 30%。"
-    return "没有新的切换条件：按推荐规则保持上一目标仓位。"
+    if not signal.get("rebalance_due", False):
+        return "本日不是月度确认日：按推荐规则保持上一月度目标仓位。"
+    if signal.get("low_score_trigger"):
+        return "低分保护成立：评分 <= 4.0，按推荐规则切换或维持满仓。"
+    if signal.get("trend_trigger"):
+        return f"趋势条件成立：收盘价站上 MA{signal.get('ma_window', '')}，按推荐规则切换或维持满仓。"
+    return "月度确认日未触发低分或趋势条件：按推荐规则退出到现金管理。"
 
 
 def next_trigger_text(signal: dict) -> str:
+    ma_window = signal.get("ma_window", "")
     if signal["target_position"] >= 0.999:
         return (
-            "后续若评分升到 4.0 以上、且收盘价跌破 MA15 下轨，策略会触发降仓到 30%。"
-            "若评分维持低位或收盘价突破 MA15 上轨，则继续满仓。"
+            f"后续月度确认时，若评分升到 4.0 以上且收盘价低于 MA{ma_window}，策略会退出到现金管理。"
+            f"若评分维持低位或收盘价站上 MA{ma_window}，则继续满仓。"
         )
     return (
-        "后续若评分回落到 4.0 以下，或收盘价突破 MA15 上轨，策略会触发加仓到 100%。"
+        f"后续月度确认时，若评分回落到 4.0 以下，或收盘价站上 MA{ma_window}，策略会加仓到 100%。"
     )
 
 
@@ -148,6 +149,11 @@ def main() -> int:
     research = read_json(ANALYSIS_DIR / "h30269_strategy_research_summary.json")
     score_value = float(signal["score"])
     action = action_prompt(current_position, target_position)
+    ma_window = int(signal.get("ma_window", recommended.get("ma_window", 0)))
+    cash_return = float(recommended.get("cash_annual_return", 0.0))
+    turnover_cost = float(recommended.get("turnover_cost", 0.0))
+    low_score = float(recommended.get("low_score", 4.0))
+    target_pass_count = research.get("target_pass_count", research.get("robust_count", 0))
 
     prompt_lines = [
         f"当前提示：**{action}**。",
@@ -181,12 +187,11 @@ def main() -> int:
 - 最新交易日：{ymd(signal['trade_date'])}
 - 最新点位：{num(signal['close'], 2)}
 - 当前评分：{num(score_value, 2)} / 10
-- MA15：{num(signal['ma15'], 2)}
-- MA15上轨：{num(signal['upper_band'], 2)}
-- MA15下轨：{num(signal['lower_band'], 2)}
+- MA{ma_window}：{num(signal['ma'], 2)}
+- 是否月度确认日：{'是' if signal.get('rebalance_due') else '否'}
 - 是否触发低分保护：{'是' if signal['low_score_trigger'] else '否'}
-- 是否触发上轨满仓：{'是' if signal['trend_enter_trigger'] else '否'}
-- 是否触发下轨降仓：{'是' if signal['base_exit_trigger'] else '否'}
+- 是否站上 MA{ma_window}：{'是' if signal.get('trend_trigger') else '否'}
+- 如果今天确认，目标仓位：{pct(signal.get('raw_target_if_rebalanced_today'))}
 - 当前策略仓位：{pct(current_position)}
 - 下一交易日目标仓位：{pct(target_position)}
 
@@ -194,26 +199,29 @@ def main() -> int:
 
 使用系统研究后选出的推荐策略作为主提示：
 
-- 评分 <= 4.0：目标仓位 100%
-- 否则，收盘价 > MA15 上轨 1.03 倍：目标仓位 100%
-- 否则，评分 > 4.0 且收盘价 < MA15 下轨 0.97 倍：目标仓位 30%
-- 其余情况：保持上一目标仓位
+- 每月最后一个交易日收盘后确认，下一交易日执行
+- 评分 <= {num(low_score, 1)}：目标仓位 100%
+- 否则，收盘价 > MA{ma_window}：目标仓位 100%
+- 否则：目标仓位 {pct(recommended['base_position'])}，未投入 H30269 的资金进入现金管理
+- 回测扣除 {pct(turnover_cost)} 的仓位变动成本，并假设空仓资金年化 {pct(cash_return)}
 
-旧的“3分买入、7分卖出”只作为情绪温度计，不再作为主策略，因为它太低频，长期年化收益输给同区间持有不动。
+旧的“3分买入、7分卖出”只作为情绪温度计，不再作为主策略，因为它太低频，长期年化收益输给同区间持有不动。若空仓资金按 0 收益计算，本策略也无法稳定达到年化超额 5%，所以现金管理是正式口径的一部分。
 
 ## 策略回测
 
 - 策略样本区间：{recommended['start_date']} 至 {recommended['end_date']}
 - 推荐策略年化收益：{pct(strategy['cagr'])}
 - 同区间持有不动年化收益：{pct(buyhold['cagr'])}
+- 推荐策略年化超额：{pct(recommended.get('excess_cagr_vs_buyhold'))}
 - 推荐策略累计收益：{pct(strategy['total_return'])}
 - 同区间持有不动累计收益：{pct(buyhold['total_return'])}
 - 推荐策略最大回撤：{pct(strategy['max_drawdown'])}
 - 同区间持有不动最大回撤：{pct(buyhold['max_drawdown'])}
 - 平均仓位：{pct(recommended['avg_exposure'])}
 - 仓位变化：{recommended['position_changes']} 次，约 {recommended['avg_changes_per_year']:.1f} 次/年
+- 年均换手：{recommended['avg_turnover_per_year']:.1f} 倍目标资金
 
-研究口径：本轮系统研究比较了 {research['candidate_count']} 个候选策略，其中 {research['robust_count']} 个通过稳健筛选。策略比较从评分首次可用日 {recommended['start_date']} 开始。
+研究口径：本轮系统研究比较了 {research['candidate_count']} 个候选策略，其中 {target_pass_count} 个达到“年化超额不少于 5%”的目标筛选。策略比较从无未来函数评分首次可用日 {recommended['start_date']} 开始。
 
 ## 分段检验
 
