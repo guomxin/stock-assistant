@@ -12,7 +12,7 @@ if [ -f run/query_server.pid ]; then
   fi
 fi
 
-nohup scripts/run_query_server.sh > logs/query_server.log 2>&1 &
+setsid scripts/run_query_server.sh > logs/query_server.log 2>&1 < /dev/null &
 pid="$!"
 printf '%s\n' "${pid}" > run/query_server.pid
 sleep 1
