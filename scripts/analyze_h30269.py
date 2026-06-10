@@ -26,6 +26,7 @@ ANALYSIS_DIR = BASE_DIR / "analysis" / "h30269"
 DB_PATH = BASE_DIR / "db" / "a_share_factors.duckdb"
 
 TARGET = "H30269.CSI"
+TOTAL_RETURN_CODE = "h20269.CSI"  # 红利低波全收益，回测收益基准
 BENCHMARKS = {
     "000300.SH": "沪深300",
     "000922.CSI": "中证红利",
@@ -163,7 +164,11 @@ def expanding_percentile(series: pd.Series, min_periods: int = MIN_SCORE_OBSERVA
     return pd.Series(out, index=series.index)
 
 
-def build_indicator_frame(target: pd.DataFrame, benchmarks: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def build_indicator_frame(
+    target: pd.DataFrame,
+    benchmarks: dict[str, pd.DataFrame],
+    total_return: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     df = target[["trade_date", "close", "pct_chg"]].copy()
     df["trade_date"] = df["trade_date"].astype(str)
     df["ret_1"] = df["close"].pct_change()
@@ -173,6 +178,11 @@ def build_indicator_frame(target: pd.DataFrame, benchmarks: dict[str, pd.DataFra
         b = bench[["trade_date", "close"]].rename(columns={"close": f"close_{key}"})
         b["trade_date"] = b["trade_date"].astype(str)
         df = df.merge(b, on="trade_date", how="left")
+
+    if total_return is not None:
+        tr = total_return[["trade_date", "close"]].rename(columns={"close": "tr_close"})
+        tr["trade_date"] = tr["trade_date"].astype(str)
+        df = df.merge(tr, on="trade_date", how="left")
 
     df["ma250"] = df["close"].rolling(250, min_periods=120).mean()
     df["ma250_dev"] = df["close"] / df["ma250"] - 1
@@ -527,8 +537,10 @@ def main() -> int:
     for code in BENCHMARKS:
         time.sleep(0.2)
         benchmarks[code] = fetch_index_daily(pro, code, args.start_date, args.end_date, args.refresh)
+    time.sleep(0.2)
+    total_return = fetch_index_daily(pro, TOTAL_RETURN_CODE, args.start_date, args.end_date, args.refresh)
 
-    indicators = build_indicator_frame(target, benchmarks)
+    indicators = build_indicator_frame(target, benchmarks, total_return)
     scored, component_latest = add_score(indicators)
     scored = add_forward_returns(scored, [60, 120, 250])
     backtest = zone_backtest(scored, [60, 120, 250])

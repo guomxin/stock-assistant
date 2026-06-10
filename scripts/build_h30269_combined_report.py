@@ -153,7 +153,6 @@ def main() -> int:
     cash_return = float(recommended.get("cash_annual_return", 0.0))
     turnover_cost = float(recommended.get("turnover_cost", 0.0))
     low_score = float(recommended.get("low_score", 4.0))
-    target_pass_count = research.get("target_pass_count", research.get("robust_count", 0))
 
     prompt_lines = [
         f"当前提示：**{action}**。",
@@ -204,10 +203,11 @@ def main() -> int:
 - 否则，收盘价 > MA{ma_window}：目标仓位 100%
 - 否则：目标仓位 {pct(recommended['base_position'])}，未投入 H30269 的资金进入现金管理
 - 回测扣除 {pct(turnover_cost)} 的仓位变动成本，并假设空仓资金年化 {pct(cash_return)}
+- 策略与持有收益均按红利低波全收益指数 h20269.CSI（含股息再投资）计算；点位与信号仍按价格指数口径
 
-旧的“3分买入、7分卖出”只作为情绪温度计，不再作为主策略，因为它太低频，长期年化收益输给同区间持有不动。若空仓资金按 0 收益计算，本策略也无法稳定达到年化超额 5%，所以现金管理是正式口径的一部分。
+旧的“3分买入、7分卖出”只作为情绪温度计，不再作为主策略。现金管理收益是正式口径的一部分；全收益口径下，本策略近年的主要贡献是降低回撤而非增厚收益。
 
-## 策略回测
+## 策略回测（全收益口径）
 
 - 策略样本区间：{recommended['start_date']} 至 {recommended['end_date']}
 - 推荐策略年化收益：{pct(strategy['cagr'])}
@@ -221,7 +221,7 @@ def main() -> int:
 - 仓位变化：{recommended['position_changes']} 次，约 {recommended['avg_changes_per_year']:.1f} 次/年
 - 年均换手：{recommended['avg_turnover_per_year']:.1f} 倍目标资金
 
-研究口径：本轮系统研究比较了 {research['candidate_count']} 个候选策略，其中 {target_pass_count} 个达到“年化超额不少于 5%”的目标筛选。策略比较从无未来函数评分首次可用日 {recommended['start_date']} 开始。
+研究口径：策略来自 {research['candidate_count']} 个候选的系统研究，并于 2026-06 经过 IS/OOS 切分与 walk-forward 防过拟合复检（见 analysis/h30269/robust_research/）；2026-06-10 起回测基准切换为全收益指数。策略比较从无未来函数评分首次可用日 {recommended['start_date']} 开始。
 
 ## 分段检验
 

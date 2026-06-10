@@ -267,6 +267,8 @@ def main() -> int:
     row = previous.copy()
     row["trade_date"] = estimate.trade_date
     row["close"] = estimate.close
+    if "tr_close" in row.index:
+        row["tr_close"] = np.nan
     for code in BENCHMARKS:
         key = code.replace(".", "_")
         prev_col = f"close_{key}"

@@ -7,6 +7,10 @@ Main rule (monthly signal, next-trading-day execution):
 - Otherwise hold 0% H30269 and keep the capital in cash-like instruments.
 
 The backtest uses as-of expanding score percentiles to avoid look-ahead bias.
+Signals (MA24, score) stay on the price index H30269.CSI; strategy and
+buy-and-hold returns are computed on the total-return index h20269.CSI so the
+benchmark keeps its dividends (the price index understates holding returns by
+~4%/year and would overstate the value of switching to cash).
 """
 
 from __future__ import annotations
@@ -86,6 +90,23 @@ def add_asof_score(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def reconstruct_total_return(df: pd.DataFrame) -> pd.Series:
+    """全收益收盘序列；缺口（盘中估算日、全收益当日未发布）用价格收益顺延填补."""
+    if "tr_close" not in df.columns:
+        raise SystemExit(
+            "score history lacks tr_close; rerun analyze_h30269.py (it fetches h20269.CSI) first"
+        )
+    price = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
+    tr = pd.to_numeric(df["tr_close"], errors="coerce").to_numpy(dtype=float)
+    out = np.full(len(df), np.nan)
+    for i in range(len(df)):
+        if np.isfinite(tr[i]):
+            out[i] = tr[i]
+        elif i > 0 and np.isfinite(out[i - 1]) and price[i - 1] > 0 and np.isfinite(price[i]):
+            out[i] = out[i - 1] * (price[i] / price[i - 1])
+    return pd.Series(out, index=df.index)
+
+
 def metric(frame: pd.DataFrame, ret_col: str, nav_col: str) -> dict[str, float]:
     nav = frame[nav_col] / frame[nav_col].iloc[0]
     ret = frame[ret_col]
@@ -153,16 +174,18 @@ def build_signal(df: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> int:
     raw_df = pd.read_csv(SCORE_HISTORY, dtype={"trade_date": str}).sort_values("trade_date").reset_index(drop=True)
-    raw_price = raw_df.dropna(subset=["close"]).reset_index(drop=True)
+    raw_df["tr_nav_close"] = reconstruct_total_return(raw_df)
+    raw_price = raw_df.dropna(subset=["close", "tr_nav_close"]).reset_index(drop=True)
     raw_price["date"] = pd.to_datetime(raw_price["trade_date"])
-    raw_price["buyhold_ret"] = raw_price["close"].pct_change().fillna(0)
+    raw_price["buyhold_ret"] = raw_price["tr_nav_close"].pct_change().fillna(0)
     raw_price["buyhold_nav"] = (1 + raw_price["buyhold_ret"]).cumprod()
     inception_buyhold = metric(raw_price, "buyhold_ret", "buyhold_nav")
 
     df = add_asof_score(raw_df)
     df = df.dropna(subset=["score", "close"]).reset_index(drop=True)
     df["date"] = pd.to_datetime(df["trade_date"])
-    df["daily_ret"] = df["close"].pct_change().fillna(0)
+    # 收益按全收益指数；点位、MA 与评分仍按价格指数
+    df["daily_ret"] = df["tr_nav_close"].pct_change().fillna(0)
     df[f"ma{MA_WINDOW}"] = df["close"].rolling(MA_WINDOW, min_periods=MA_WINDOW).mean()
     df = build_signal(df)
 
@@ -237,6 +260,7 @@ def main() -> int:
     summary = {
         "rule_name": "H30269 monthly MA24 low-score strategy",
         "strategy_type": "monthly_core_trend_low",
+        "return_basis": "total_return_h20269",
         "base_position": BASE_POSITION,
         "ma_window": MA_WINDOW,
         "low_score": LOW_SCORE,
@@ -261,6 +285,7 @@ def main() -> int:
     out_cols = [
         "trade_date",
         "close",
+        "tr_nav_close",
         "score",
         "score_reported",
         ma_col,
@@ -315,7 +340,7 @@ def main() -> int:
 - 否则，收盘价 > MA{MA_WINDOW}：目标仓位 100%
 - 否则：目标仓位 {pct(BASE_POSITION)}，未投入 H30269 的资金进入现金管理
 
-回测扣除 {pct(TURNOVER_COST)} 的仓位变动成本，并假设空仓资金年化 {pct(CASH_ANNUAL_RETURN)}。评分历史使用截至当日可见的扩展分位，避免使用未来样本。
+回测扣除 {pct(TURNOVER_COST)} 的仓位变动成本，并假设空仓资金年化 {pct(CASH_ANNUAL_RETURN)}。评分历史使用截至当日可见的扩展分位，避免使用未来样本。策略持仓与"持有不动"收益均按红利低波**全收益指数 h20269.CSI**（含股息再投资）计算；点位、MA{MA_WINDOW} 与评分仍按价格指数 H30269.CSI 口径。
 
 ## 全样本结果
 
@@ -333,7 +358,7 @@ def main() -> int:
 - 仓位变化：{summary['position_changes']} 次，约 {summary['avg_changes_per_year']:.1f} 次/年
 - 年均换手：{summary['avg_turnover_per_year']:.1f} 倍目标资金
 
-说明：策略需要无未来函数评分，所以策略比较从 {summary['start_date']} 开始；H30269 在 Tushare 中最早可取日为 {summary['inception_start_date']}，若从该日直接持有到 {summary['end_date']}，年化收益为 {pct(inception_buyhold['cagr'])}，累计收益为 {pct(inception_buyhold['total_return'])}。
+说明：策略需要无未来函数评分，所以策略比较从 {summary['start_date']} 开始；全收益指数最早可取日为 {summary['inception_start_date']}，若从该日直接持有全收益指数到 {summary['end_date']}，年化收益为 {pct(inception_buyhold['cagr'])}，累计收益为 {pct(inception_buyhold['total_return'])}。
 
 ## 分段检验
 
@@ -367,7 +392,7 @@ def main() -> int:
 
 ## 结论
 
-该规则不是预测涨跌，而是月度仓位管理：低分或短期趋势恢复时持有红利低波；趋势弱且评分不低时退到现金管理。若空仓现金收益按 0 计算，年化超额会低于 5%；因此现金管理假设是该策略达标的一部分，执行时需要真实落实。
+该规则不是预测涨跌，而是月度仓位管理：低分或短期趋势恢复时持有红利低波；趋势弱且评分不低时退到现金管理。现金管理假设是回测口径的一部分，执行时需要真实落实。全收益口径下，该策略的长期超额主要来自 2008-2016 的极端行情保护，2019 年以来的主要贡献是降低回撤而非增厚收益（详见 analysis/h30269/robust_research/）。
 """
     (ANALYSIS_DIR / "h30269_recommended_strategy_report.md").write_text(report, encoding="utf-8")
     print(report)
