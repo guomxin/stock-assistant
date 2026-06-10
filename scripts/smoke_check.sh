@@ -43,6 +43,7 @@ check "query health" curl -fsS --max-time 5 "http://127.0.0.1:8088/health"
 check "a-share query sample" curl -fsS --max-time 5 "http://127.0.0.1:8088/?q=600519"
 check "hk query sample" curl -fsS --max-time 5 "http://127.0.0.1:8088/hk?q=00700"
 check "h30269 page" curl -fsS --max-time 5 "http://127.0.0.1:8088/h30269"
+check "kcb50 page" curl -fsS --max-time 5 "http://127.0.0.1:8088/kcb50"
 
 check "duckdb latest dates" .venv/bin/python -c "import duckdb; con=duckdb.connect('db/a_share_factors.duckdb', read_only=True); print(con.execute(\"select 'factor_daily', max(snapshot_trade_date) from factor_daily union all select 'hk_factor_daily', max(snapshot_trade_date) from hk_factor_daily\").fetchall())"
 

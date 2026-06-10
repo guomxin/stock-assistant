@@ -8,6 +8,11 @@
 - 运维手册：`OPERATIONS.md`
 - 查询服务：`scripts/query_server.py`
 - H30269 主任务：`scripts/run_h30269_action_report.sh`
+- H30269 评分生成：`scripts/analyze_h30269.py`
+- H30269 策略研究：`scripts/research_h30269_strategy.py`
+- H30269 推荐策略回测：`scripts/backtest_h30269_recommended_strategy.py`
+- 科创50评分与策略研究：`scripts/analyze_kcb50_strategy.py`
+- 科创50定时刷新：`scripts/run_kcb50_action_report.sh`
 - 纳斯达克100数据抓取：`scripts/fetch_nasdaq100.py`
 - 纳斯达克100评分与策略研究：`scripts/analyze_nasdaq100_strategy.py`
 - 纳斯达克100当前成分股价格抓取：`scripts/fetch_nasdaq100_constituent_prices.py`
@@ -28,6 +33,7 @@ scripts/smoke_check.sh
 - A 股查询：`http://127.0.0.1:8088/`
 - 港股查询：`http://127.0.0.1:8088/hk`
 - H30269 行动报告：`http://127.0.0.1:8088/h30269`
+- 科创50行动报告：`http://127.0.0.1:8088/kcb50`
 - 健康检查：`http://127.0.0.1:8088/health`
 
 ## 注意事项

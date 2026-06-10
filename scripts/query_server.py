@@ -23,6 +23,8 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = BASE_DIR / "db" / "a_share_factors.duckdb"
 H30269_DIR = BASE_DIR / "analysis" / "h30269"
 H30269_DAILY_CLOSE_DIR = H30269_DIR / "daily_close_reports"
+KCB50_DIR = BASE_DIR / "analysis" / "kcb50"
+KCB50_DAILY_CLOSE_DIR = KCB50_DIR / "daily_close_reports"
 XUEQIU_ALERT_PATH = BASE_DIR / "logs" / "xueqiu_cookie_alert.json"
 
 
@@ -321,6 +323,17 @@ class QueryHandler(BaseHTTPRequestHandler):
                 )
             )
             return
+        if parsed.path == "/kcb50":
+            self.respond_html(self.render_kcb50_report(parsed.query))
+            return
+        if parsed.path == "/kcb50_research":
+            self.respond_html(
+                self.render_markdown_report(
+                    "科创50 策略研究",
+                    KCB50_DIR / "kcb50_strategy_report.md",
+                )
+            )
+            return
         config = MARKETS.get(parsed.path)
         if config is None:
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -441,6 +454,34 @@ class QueryHandler(BaseHTTPRequestHandler):
             title=html.escape(title),
             body=html.escape(body_text),
             extra=render_xueqiu_alert() + render_h30269_history_controls(archive_files, requested_date),
+            generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    def render_kcb50_report(self, query: str = "") -> str:
+        params = parse_qs(query)
+        requested_date = params.get("date", [""])[0].strip()
+        archive_files = list_kcb50_daily_close_reports()
+
+        if requested_date:
+            archive_path = KCB50_DAILY_CLOSE_DIR / f"kcb50_action_report_{requested_date}.md"
+            if archive_path.exists():
+                body_text = archive_path.read_text(encoding="utf-8").strip()
+                title = f"科创50 收盘报告 {fmt_date(requested_date)}"
+            else:
+                body_text = f"没有找到 {fmt_date(requested_date)} 的收盘报告。"
+                title = "科创50 收盘报告"
+        else:
+            path = KCB50_DIR / "kcb50_strategy_report.md"
+            if path.exists():
+                body_text = path.read_text(encoding="utf-8").strip()
+            else:
+                body_text = f"报告尚未生成：{path}"
+            title = "科创50 行动报告"
+
+        return REPORT_TEMPLATE.format(
+            title=html.escape(title),
+            body=html.escape(body_text),
+            extra=render_xueqiu_alert() + render_kcb50_history_controls(archive_files, requested_date),
             generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
 
@@ -570,6 +611,43 @@ def render_h30269_history_controls(archive_dates: list[str], selected_date: str)
         </select>
         <button type="submit">查看</button>
         <a class="button secondary" href="/h30269">最新报告</a>
+      </form>
+      <div class="history-links">{links_html}</div>
+    </section>
+"""
+
+
+def list_kcb50_daily_close_reports() -> list[str]:
+    if not KCB50_DAILY_CLOSE_DIR.exists():
+        return []
+    dates = []
+    for path in KCB50_DAILY_CLOSE_DIR.glob("kcb50_action_report_*.md"):
+        date = path.stem.removeprefix("kcb50_action_report_")
+        if len(date) == 8 and date.isdigit():
+            dates.append(date)
+    return sorted(set(dates), reverse=True)
+
+
+def render_kcb50_history_controls(archive_dates: list[str], selected_date: str) -> str:
+    options = ['<option value="">最新报告</option>']
+    for date in archive_dates:
+        selected = " selected" if date == selected_date else ""
+        options.append(f'<option value="{esc(date)}"{selected}>{fmt_date(date)}</option>')
+
+    latest_links = []
+    for date in archive_dates[:20]:
+        active = " active" if date == selected_date else ""
+        latest_links.append(f'<a class="chip{active}" href="/kcb50?date={esc(date)}">{fmt_date(date)}</a>')
+    links_html = "\n".join(latest_links) if latest_links else '<span class="muted">暂无收盘归档</span>'
+
+    return f"""
+    <section class="history-panel">
+      <form class="history-form" method="get" action="/kcb50">
+        <select name="date">
+          {"".join(options)}
+        </select>
+        <button type="submit">查看</button>
+        <a class="button secondary" href="/kcb50">最新报告</a>
       </form>
       <div class="history-links">{links_html}</div>
     </section>
@@ -799,6 +877,7 @@ def render_page(
         <a class="button secondary {active_a}" href="/">A股查询</a>
         <a class="button secondary {active_hk}" href="/hk">港股查询</a>
         <a class="button secondary" href="/h30269">红利低波行动报告</a>
+        <a class="button secondary" href="/kcb50">科创50行动报告</a>
       </nav>
     </section>
 
@@ -991,6 +1070,7 @@ REPORT_TEMPLATE = """<!doctype html>
       <a href="/">A股查询</a>
       <a href="/hk">港股查询</a>
       <a href="/h30269">红利低波行动报告</a>
+      <a href="/kcb50">科创50行动报告</a>
       <span class="muted">页面生成于 {generated_at}</span>
     </div>
     {extra}

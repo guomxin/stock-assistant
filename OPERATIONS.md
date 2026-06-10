@@ -106,6 +106,35 @@ cd /mnt/ssd01/stocks
 H30269_OFFICIAL_DAILY_MAX_ATTEMPTS=1 scripts/run_h30269_action_report.sh afternoon-close
 ```
 
+## 科创50
+
+网页：
+
+```text
+http://127.0.0.1:8088/kcb50
+```
+
+手动刷新：
+
+```bash
+cd /mnt/ssd01/stocks
+scripts/run_kcb50_action_report.sh morning-close
+scripts/run_kcb50_action_report.sh afternoon-close
+```
+
+安装中午/下午收盘定时任务：
+
+```bash
+cd /mnt/ssd01/stocks
+scripts/install_kcb50_cron.sh
+```
+
+默认 cron：
+
+- 11:35 刷新最新可得官方日线并更新 `/kcb50`。
+- 18:30 等待 Tushare 当天 `000688.SH` 官方日线，生成 `/kcb50` 并归档收盘报告。
+- 科创50任务不发雪球。
+
 ## 雪球
 
 只验证登录态和文本，不发帖：
