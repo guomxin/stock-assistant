@@ -152,7 +152,7 @@ scripts/install_kcb50_cron.sh
 
 ## 雪球
 
-只验证登录态和文本，不发帖：
+只验证发送令牌和文本，不发帖（即使该时段已发布，仍会真实校验）：
 
 ```bash
 cd /mnt/ssd01/stocks
@@ -164,13 +164,21 @@ scripts/post_xueqiu_status.py \
   --validate-only
 ```
 
-遇到 `400019` 后刷新 WAF/Cookie：
+发送仍走 HTTP 接口。服务器返回的 `Set-Cookie` 会保存到 `.env`，取发送令牌后使用最新 Cookie 发帖。取令牌时登录失效、访问保护或明确的 `400019` 拒绝会尝试刷新一次，再重试一次；发布结果不明确或网络超时不自动重发，避免重复帖子。
+
+浏览器刷新依赖 `requirements.txt` 中的 Playwright 和本机 Google Chrome，无需另行下载 Chromium。手动刷新（不发帖）：
 
 ```bash
 cd /mnt/ssd01/stocks
 source .venv/bin/activate
 .venv/bin/python scripts/xueqiu_waf_refresh.py --write-env
 ```
+
+刷新会连接本机 `127.0.0.1:9223` 上已打开的专用 Chrome，或在无浏览器时使用 `run/xueqiu_chrome_profile/` 持久资料启动无界面 Chrome。复用已有登录和站点存储，验证发送令牌后才写入 Cookie 和浏览器 User-Agent；账号与 `.env` 不一致时停止，不会自动切换账号。
+
+`logs/xueqiu_cookie_alert.json` 区分 `cookie_invalid`（登录态失效）、`verification_required`（需要人工人机验证）和其他发送错误。人机验证必须由用户完成，不能保证免除雪球侧登录或验证要求。请使用同一专用资料目录打开可见 Chrome 完成操作，再运行上述刷新和 `--validate-only`；仅凭 HTTP 200 不判定发布成功，必须收到帖子 ID。
+
+刷新摘要在 `logs/xueqiu_waf_refresh.json`，不记录 Cookie 值或页面正文。回归检查：`.venv/bin/python -m unittest discover -s tests -v`。
 
 ## 定时任务
 

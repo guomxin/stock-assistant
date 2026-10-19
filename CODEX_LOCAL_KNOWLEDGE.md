@@ -484,7 +484,11 @@ scripts/post_xueqiu_status.py \
 1. `GET https://xueqiu.com/provider/session/token.json?api_path=%2Fstatuses%2Fupdate.json` 取 `session_token`。
 2. `POST https://xueqiu.com/statuses/update.json`，表单包含 `status`、`allow_reward=false`、`ai_disclose=0`、`session_token`。
 
-`post_xueqiu_status.py` 已内置上述流程。遇到 `400019` 时会尝试调用 `xueqiu_waf_refresh.py --write-env` 后重试一次。
+`post_xueqiu_status.py` 已内置上述流程。2026-10-19 修补：HTTP 响应中的 `Set-Cookie` 会更新 `.env`，发送时重新读取取令牌后更新的 Cookie；JSON 错误或 HTML 不再仅凭 HTTP 200 视为成功，发布必须返回帖子 ID。`--validate-only` 同时检查发送令牌和文本，已发帖的时段也可真实校验。
+
+取令牌时的 `400016`、访问验证页面，以及明确的 `400019` 拒绝会调用 `xueqiu_waf_refresh.py --write-env`，最多刷新并重试一次。网络异常、发布结果不明不自动重发。刷新使用本机 Google Chrome，优先连接 `127.0.0.1:9223`，否则使用 `run/xueqiu_chrome_profile/` 持久资料无界面启动；不再创建全新的临时登录环境。依赖 `playwright>=1.40,<2` 已加入 `requirements.txt`。刷新确认发送令牌有效后才保存 Cookie 和实际 User-Agent，账号不一致则停止。
+
+告警区分 `cookie_invalid` 和 `verification_required`，后者需要用户在相同 Chrome 资料目录中完成人机验证，不能用自动刷新替代。刷新日志只保存状态摘要。回归检查：`.venv/bin/python -m unittest discover -s tests -v`。
 
 相关文件：
 
@@ -496,7 +500,7 @@ scripts/post_xueqiu_status.py \
 重复保护：
 
 - 所有以 `posted` 开头的状态都应视为已发布，包括历史 `posted_via_chrome`。
-- 当前生产方向是 HTTP 接口发帖，不应依赖本机 Chrome。
+- 发布仍使用 HTTP 接口；本机专用 Chrome 仅用于必要时恢复登录态和人工验证。
 
 最新实测：
 
@@ -624,7 +628,7 @@ H30269 收盘日期不对：
 
 1. 查 `logs/xueqiu_post_history.jsonl`。
 2. 查 `logs/xueqiu_cookie_alert.json`。
-3. 如果是 `400019`，先运行：
+3. 对 `400016`、`400019` 或访问保护，可先手动刷新一次；若提示 `verification_required`，先在专用 Chrome 中完成人机验证再刷新：
 
    ```bash
    cd /mnt/ssd01/stocks
@@ -633,7 +637,7 @@ H30269 收盘日期不对：
    ```
 
 4. 再用 `post_xueqiu_status.py --validate-only` 验证。
-5. 不要把解决方案退回到本机 Chrome；当前生产脚本应走 HTTP 接口。
+5. 发帖仍走 HTTP 接口，Chrome 仅恢复登录态；发布结果不明时先人工核实，不盲目补发。
 
 ## 15. 后续开发习惯
 

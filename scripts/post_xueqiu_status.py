@@ -10,13 +10,14 @@ import os
 import random
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib import parse, request
 from urllib.error import HTTPError, URLError
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv, set_key, unset_key
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -26,6 +27,13 @@ ALERT_PATH = LOG_DIR / "xueqiu_cookie_alert.json"
 DEFAULT_API_URL = "https://xueqiu.com/statuses/update.json"
 DEFAULT_CHECK_URL = "https://api.xueqiu.com/statuses/text_check.json"
 DEFAULT_TOKEN_URL = "https://xueqiu.com/provider/session/token.json"
+
+
+class XueqiuError(RuntimeError):
+    def __init__(self, reason: str, message: str, recoverable: bool = False):
+        super().__init__(message)
+        self.reason = reason
+        self.recoverable = recoverable
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,12 +88,14 @@ def clear_alert() -> None:
     ALERT_PATH.unlink(missing_ok=True)
 
 
-def looks_like_auth_error(message: str) -> bool:
-    text = message.lower()
-    return any(
-        key in text
-        for key in ["missing xueqiu_cookie", "unauthorized", "forbidden", "login", "登录", "请先登录", "cookie", "401", "403"]
-    )
+def failure_alert(exc: Exception, row: dict) -> None:
+    reason = getattr(exc, "reason", "post_failed")
+    details = {
+        "cookie_invalid": "雪球登录态已失效，自动刷新未恢复，请重新登录。",
+        "verification_required": "雪球触发访问保护，请在浏览器完成人机验证。",
+        "waf_blocked": "雪球访问保护未恢复，请检查浏览器验证状态。",
+    }
+    write_alert(reason, details.get(reason, str(exc)[:300]), row)
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -103,6 +113,99 @@ def get_xueqiu_cookie() -> str:
     if not encoded:
         return ""
     return base64.b64decode(encoded).decode("utf-8").strip()
+
+
+def save_cookie(cookie: str, user_agent: str | None = None) -> None:
+    env_path = BASE_DIR / ".env"
+    values = dotenv_values(env_path)
+    encoded = base64.b64encode(cookie.encode("utf-8")).decode("ascii")
+    if values.get("XUEQIU_COOKIE_B64") != encoded:
+        set_key(env_path, "XUEQIU_COOKIE_B64", encoded)
+    if "XUEQIU_COOKIE" in values:
+        unset_key(env_path, "XUEQIU_COOKIE")
+    os.environ.pop("XUEQIU_COOKIE", None)
+    os.environ["XUEQIU_COOKIE_B64"] = encoded
+    if user_agent:
+        if values.get("XUEQIU_USER_AGENT") != user_agent:
+            set_key(env_path, "XUEQIU_USER_AGENT", user_agent)
+        os.environ["XUEQIU_USER_AGENT"] = user_agent
+
+
+def save_response_cookies(headers) -> None:
+    cookies = SimpleCookie()
+    cookies.load(get_xueqiu_cookie())
+    changed = False
+    for header in headers.get_all("Set-Cookie", []):
+        received = SimpleCookie()
+        received.load(header)
+        for name, morsel in received.items():
+            domain = morsel["domain"].lstrip(".")
+            if domain and domain != "xueqiu.com" and not domain.endswith(".xueqiu.com"):
+                continue
+            expired = False
+            if morsel["max-age"]:
+                try:
+                    expired = int(morsel["max-age"]) <= 0
+                except ValueError:
+                    pass
+            if not morsel["max-age"] and morsel["expires"]:
+                try:
+                    expired = parsedate_to_datetime(morsel["expires"]) <= datetime.now(timezone.utc)
+                except (ValueError, TypeError):
+                    pass
+            if expired:
+                if name in cookies:
+                    del cookies[name]
+                    changed = True
+            elif name not in cookies or cookies[name].value != morsel.value:
+                cookies[name] = morsel.value
+                changed = True
+    if changed:
+        cookie = "; ".join(f"{name}={m.value}" for name, m in cookies.items())
+        try:
+            save_cookie(cookie)
+        except OSError:
+            os.environ.pop("XUEQIU_COOKIE", None)
+            os.environ["XUEQIU_COOKIE_B64"] = base64.b64encode(cookie.encode()).decode()
+            print("Warning: refreshed Xueqiu cookies could not be saved to .env", file=sys.stderr)
+
+
+def parse_response(body: str, stage: str, http_status: int = 200) -> dict:
+    try:
+        result = json.loads(body)
+    except json.JSONDecodeError as exc:
+        if any(marker in body for marker in ("人机验证", "check.xueqiu.com", "访问触发保护")):
+            raise XueqiuError("verification_required", "雪球要求完成人机验证", stage != "post") from exc
+        raise XueqiuError("invalid_response", f"xueqiu {stage}: expected JSON (http {http_status})") from exc
+    if not isinstance(result, dict):
+        raise XueqiuError("invalid_response", f"xueqiu {stage}: expected JSON object")
+    code = str(result.get("error_code", ""))
+    if code not in ("", "0") or result.get("success") is False or result.get("error"):
+        reason = "cookie_invalid" if code == "400016" or http_status == 401 else "api_error"
+        if code == "400019":
+            reason = "waf_blocked"
+        detail = str(result.get("error_description") or result.get("error") or "request rejected")[:200]
+        # Only retry explicit rejections, never an ambiguous publication result.
+        recoverable = code == "400019" or (reason == "cookie_invalid" and stage != "post")
+        raise XueqiuError(reason, f"xueqiu {stage}: {code} {detail}", recoverable)
+    if http_status >= 400:
+        raise XueqiuError("request_failed", f"xueqiu {stage}: http {http_status}")
+    return result
+
+
+def read_response(req: request.Request, stage: str) -> tuple[int, str, dict]:
+    try:
+        with request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            save_response_cookies(resp.headers)
+            return resp.status, body, parse_response(body, stage, resp.status)
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        save_response_cookies(exc.headers)
+        parse_response(body, stage, exc.code)
+        raise XueqiuError("request_failed", f"xueqiu {stage}: http {exc.code}") from exc
+    except URLError as exc:
+        raise XueqiuError("request_failed", f"xueqiu {stage}: network request failed") from exc
 
 
 def token_from_cookie(cookie: str, name: str) -> str:
@@ -137,18 +240,15 @@ def xueqiu_headers(cookie: str, referer: str = "https://xueqiu.com/") -> dict[st
     return headers
 
 
-def call_xueqiu(api_url: str, payload: dict[str, str], cookie: str) -> tuple[int, str]:
+def call_xueqiu(api_url: str, payload: dict[str, str], cookie: str, stage: str = "post") -> tuple[int, str]:
     data = parse.urlencode(payload).encode("utf-8")
     req = request.Request(api_url, data=data, headers=xueqiu_headers(cookie), method="POST")
-    try:
-        with request.urlopen(req, timeout=20) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            return resp.status, body
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"xueqiu http {exc.code}: {body[:500]}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"xueqiu request failed: {exc}") from exc
+    status, body, result = read_response(req, stage)
+    if stage == "post" and not result.get("id"):
+        raise XueqiuError("post_unconfirmed", "雪球未返回帖子 ID，请人工确认，避免重复发帖")
+    if stage == "validate" and result.get("success") is not True:
+        raise XueqiuError("invalid_response", "雪球文本校验未返回 success=true")
+    return status, body
 
 
 def get_session_token(api_path: str = "/statuses/update.json") -> str:
@@ -158,20 +258,10 @@ def get_session_token(api_path: str = "/statuses/update.json") -> str:
     token_url = os.getenv("XUEQIU_SESSION_TOKEN_URL", DEFAULT_TOKEN_URL).strip() or DEFAULT_TOKEN_URL
     url = f"{token_url}?{parse.urlencode({'api_path': api_path})}"
     req = request.Request(url, headers=xueqiu_headers(cookie), method="GET")
-    try:
-        with request.urlopen(req, timeout=20) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"xueqiu token http {exc.code}: {body[:500]}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"xueqiu token request failed: {exc}") from exc
-    try:
-        token = json.loads(body).get("session_token", "")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"xueqiu token response is not json: {body[:200]}") from exc
+    _, _, result = read_response(req, "token")
+    token = result.get("session_token", "")
     if not token:
-        raise RuntimeError(f"xueqiu token response missing session_token: {body[:200]}")
+        raise XueqiuError("invalid_response", "xueqiu token response missing session_token")
     return token
 
 
@@ -179,20 +269,40 @@ def refresh_waf_cookie() -> bool:
     refresh_script = BASE_DIR / "scripts" / "xueqiu_waf_refresh.py"
     if not refresh_script.exists():
         return False
-    proc = subprocess.run(
-        [sys.executable, str(refresh_script), "--write-env"],
-        cwd=BASE_DIR,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=90,
-        check=False,
-    )
-    if proc.returncode != 0:
-        print(proc.stderr[-1000:], file=sys.stderr)
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(refresh_script), "--write-env"],
+            cwd=BASE_DIR,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        print("Xueqiu browser refresh failed or timed out", file=sys.stderr)
         return False
+    if proc.returncode != 0:
+        try:
+            result = json.loads(proc.stdout)
+        except (ValueError, TypeError):
+            print("Xueqiu browser refresh unavailable; check logs/xueqiu_waf_refresh.json", file=sys.stderr)
+            return False
+        if result.get("reason") in {"verification_required", "cookie_invalid", "account_mismatch"}:
+            raise XueqiuError(result["reason"], result.get("detail", "browser refresh failed"))
+        return False
+    os.environ.pop("XUEQIU_COOKIE", None)
     load_dotenv(BASE_DIR / ".env", override=True)
     return True
+
+
+def with_recovery(action):
+    try:
+        return action()
+    except XueqiuError as exc:
+        if not exc.recoverable or not refresh_waf_cookie():
+            raise
+    return action()
 
 
 def validate_text(text: str) -> tuple[int, str]:
@@ -208,6 +318,7 @@ def validate_text(text: str) -> tuple[int, str]:
             "x": f"{random.random():.17f}",
         },
         cookie,
+        stage="validate",
     )
 
 
@@ -225,7 +336,7 @@ def post_status(text: str) -> tuple[int, str]:
             "ai_disclose": "0",
             "session_token": session_token,
         },
-        cookie,
+        get_xueqiu_cookie(),
     )
 
 
@@ -245,7 +356,7 @@ def main() -> int:
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    if history_contains(args.trade_date, args.session_label):
+    if not args.validate_only and history_contains(args.trade_date, args.session_label):
         row = {**base_row, "status": "skipped_duplicate"}
         append_history(row)
         print("skip duplicate Xueqiu post")
@@ -267,14 +378,15 @@ def main() -> int:
 
     if args.validate_only:
         try:
-            status_code, body = validate_text(text)
+            def validate():
+                get_session_token()
+                return validate_text(text)
+
+            status_code, body = with_recovery(validate)
         except Exception as exc:
             row = {**base_row, "status": "validate_failed", "error": str(exc)}
             append_history(row)
-            if looks_like_auth_error(str(exc)):
-                write_alert("cookie_invalid", "雪球 Cookie 可能已失效，请重新配置。", row)
-            else:
-                write_alert("post_validate_failed", str(exc)[:300], row)
+            failure_alert(exc, row)
             print(str(exc), file=sys.stderr)
             return 1
         row = {**base_row, "status": "validated", "http_status": status_code, "response": body[:1000]}
@@ -283,29 +395,13 @@ def main() -> int:
         return 0
 
     try:
-        status_code, body = post_status(text)
+        status_code, body = with_recovery(lambda: post_status(text))
     except Exception as exc:
-        if "400019" in str(exc) and refresh_waf_cookie():
-            try:
-                status_code, body = post_status(text)
-            except Exception as retry_exc:
-                row = {**base_row, "status": "failed", "error": str(retry_exc), "first_error": str(exc)}
-                append_history(row)
-                if looks_like_auth_error(str(retry_exc)):
-                    write_alert("cookie_invalid", "雪球 Cookie 可能已失效，请重新配置。", row)
-                else:
-                    write_alert("post_failed", str(retry_exc)[:300], row)
-                print(str(retry_exc), file=sys.stderr)
-                return 1
-        else:
-            row = {**base_row, "status": "failed", "error": str(exc)}
-            append_history(row)
-            if looks_like_auth_error(str(exc)):
-                write_alert("cookie_invalid", "雪球 Cookie 可能已失效，请重新配置。", row)
-            else:
-                write_alert("post_failed", str(exc)[:300], row)
-            print(str(exc), file=sys.stderr)
-            return 1
+        row = {**base_row, "status": "failed", "error": str(exc)}
+        append_history(row)
+        failure_alert(exc, row)
+        print(str(exc), file=sys.stderr)
+        return 1
 
     row = {**base_row, "status": "posted", "http_status": status_code, "response": body[:1000]}
     append_history(row)
