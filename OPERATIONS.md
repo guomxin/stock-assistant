@@ -164,7 +164,9 @@ scripts/post_xueqiu_status.py \
   --validate-only
 ```
 
-发送仍走 HTTP 接口。服务器返回的 `Set-Cookie` 会保存到 `.env`，取发送令牌后使用最新 Cookie 发帖。取令牌时登录失效、访问保护或明确的 `400019` 拒绝会尝试刷新一次，再重试一次；发布结果不明确或网络超时不自动重发，避免重复帖子。
+发送仍走 HTTP 接口。完整 Cookie 会话保存在 `run/xueqiu_http_session.json`（权限 `600`，已被 git 忽略），包含 Cookie 的域、路径、有效期及浏览器 User-Agent。正式请求通过 Playwright 的独立 HTTP 会话加载它，跨 `xueqiu.com` / `www.xueqiu.com` 跳转时由 Cookie jar 为目标站点重新选择 Cookie，不手工覆盖 `Cookie` 请求头。正常发送不启动浏览器；`.env` 中的字符串 Cookie 保留用于兼容和账号核对。成功响应会保存更新后的完整会话，失败或验证码页面不会覆盖有效会话；没有完整会话的旧配置仍走原 HTTP 路径，刷新成功后会迁移。
+
+取令牌时登录失效、访问保护或明确的 `400019` 拒绝会尝试刷新一次，再重试一次；发布结果不明确或网络超时不自动重发，避免重复帖子。
 
 浏览器刷新依赖 `requirements.txt` 中的 Playwright 和本机 Google Chrome，无需另行下载 Chromium。手动刷新（不发帖）：
 
@@ -174,11 +176,11 @@ source .venv/bin/activate
 .venv/bin/python scripts/xueqiu_waf_refresh.py --write-env
 ```
 
-刷新会连接本机 `127.0.0.1:9223` 上已打开的专用 Chrome，或在无浏览器时使用 `run/xueqiu_chrome_profile/` 持久资料启动无界面 Chrome。复用已有登录和站点存储，验证发送令牌后才写入 Cookie 和浏览器 User-Agent；账号与 `.env` 不一致时停止，不会自动切换账号。
+刷新会连接本机 `127.0.0.1:9223` 上已打开的专用 Chrome，或在无浏览器时使用 `run/xueqiu_chrome_profile/` 持久资料启动无界面 Chrome。复用已有登录和站点存储，必须同时验证浏览器上下文与正式发送所用的独立 HTTP 链路，才写入完整 Cookie 会话和浏览器 User-Agent；账号与 `.env` 不一致时停止，不会自动切换账号。`run/` 中的资料和会话文件含凭据，不打印或提交；若丢失，重新登录并运行刷新即可重建。
 
 `logs/xueqiu_cookie_alert.json` 区分 `cookie_invalid`（登录态失效）、`verification_required`（需要人工人机验证）和其他发送错误。人机验证必须由用户完成，不能保证免除雪球侧登录或验证要求。请使用同一专用资料目录打开可见 Chrome 完成操作，再运行上述刷新和 `--validate-only`；仅凭 HTTP 200 不判定发布成功，必须收到帖子 ID。
 
-刷新摘要在 `logs/xueqiu_waf_refresh.json`，不记录 Cookie 值或页面正文。回归检查：`.venv/bin/python -m unittest discover -s tests -v`。
+刷新摘要在 `logs/xueqiu_waf_refresh.json`，含检查时间和 `production_transport_checked`，不记录 Cookie 值或页面正文。回归检查：`.venv/bin/python -m unittest discover -s tests -v`，包含本地跨主机重定向的真实 HTTP 测试。
 
 ## 定时任务
 

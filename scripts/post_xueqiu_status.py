@@ -10,8 +10,11 @@ import os
 import random
 import subprocess
 import sys
+import tempfile
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from http.cookiejar import Cookie, CookieJar
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib import parse, request
@@ -27,6 +30,7 @@ ALERT_PATH = LOG_DIR / "xueqiu_cookie_alert.json"
 DEFAULT_API_URL = "https://xueqiu.com/statuses/update.json"
 DEFAULT_CHECK_URL = "https://api.xueqiu.com/statuses/text_check.json"
 DEFAULT_TOKEN_URL = "https://xueqiu.com/provider/session/token.json"
+HTTP_SESSION_PATH = BASE_DIR / "run/xueqiu_http_session.json"
 
 
 class XueqiuError(RuntimeError):
@@ -131,6 +135,85 @@ def save_cookie(cookie: str, user_agent: str | None = None) -> None:
         os.environ["XUEQIU_USER_AGENT"] = user_agent
 
 
+def session_cookie_header(cookies: list[dict], url: str = "https://www.xueqiu.com/") -> str:
+    jar = CookieJar()
+    for row in cookies:
+        domain = row["domain"]
+        expires = row.get("expires", -1)
+        jar.set_cookie(Cookie(
+            version=0, name=row["name"], value=row["value"],
+            port=None, port_specified=False, domain=domain,
+            domain_specified=domain.startswith("."), domain_initial_dot=domain.startswith("."),
+            path=row.get("path", "/"), path_specified=True,
+            secure=row.get("secure", True),
+            expires=None if expires < 0 else int(expires), discard=expires < 0,
+            comment=None, comment_url=None, rest={}, rfc2109=False,
+        ))
+    req = request.Request(url)
+    jar.add_cookie_header(req)
+    return req.get_header("Cookie", "")
+
+
+def save_http_session(cookies: list[dict], user_agent: str, account_id: str) -> None:
+    cookies = [c for c in cookies if c["domain"].lstrip(".") == "xueqiu.com" or c["domain"].endswith(".xueqiu.com")]
+    payload = {"cookies": cookies, "user_agent": user_agent, "account_id": account_id}
+    HTTP_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=HTTP_SESSION_PATH.parent, delete=False) as fh:
+        temp_path = Path(fh.name)
+        json.dump(payload, fh)
+    try:
+        temp_path.replace(HTTP_SESSION_PATH)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def perform_session_request(req: request.Request, session: dict, playwright=None) -> tuple[int, str, list[dict]]:
+    from playwright.sync_api import Error, sync_playwright
+
+    # The cookie jar must select credentials again after cross-host redirects.
+    headers = {k: v for k, v in req.header_items() if k.lower() != "cookie"}
+    csrf = token_from_cookie(session_cookie_header(session["cookies"]), "xq_a_token")
+    if csrf and not os.getenv("XUEQIU_CSRF_TOKEN"):
+        headers = {k: v for k, v in headers.items() if k.lower() != "x-csrf-token"}
+        headers["X-CSRF-Token"] = csrf
+    try:
+        with (nullcontext(playwright) if playwright is not None else sync_playwright()) as pw:
+            context = pw.request.new_context(
+                storage_state={"cookies": session["cookies"], "origins": []},
+                user_agent=session["user_agent"],
+            )
+            try:
+                response = context.fetch(
+                    req.full_url, method=req.get_method(), headers=headers,
+                    data=req.data, timeout=20000, max_retries=0,
+                )
+                return response.status, response.text(), context.storage_state()["cookies"]
+            finally:
+                context.dispose()
+    except Error as exc:
+        raise XueqiuError("request_failed", "雪球 HTTP 会话请求失败，请先确认发布结果") from exc
+
+
+def read_session_response(req: request.Request, stage: str) -> tuple[int, str, dict]:
+    try:
+        session = json.loads(HTTP_SESSION_PATH.read_text())
+    except (OSError, ValueError) as exc:
+        raise XueqiuError("cookie_invalid", "雪球完整会话不可用，请刷新浏览器登录态", stage != "post") from exc
+    if not isinstance(session, dict) or not isinstance(session.get("cookies"), list) or not session.get("user_agent"):
+        raise XueqiuError("cookie_invalid", "雪球完整会话格式无效，请刷新浏览器登录态", stage != "post")
+    expected_user = token_from_cookie(get_xueqiu_cookie(), "u")
+    if not expected_user or session.get("account_id") != expected_user:
+        raise XueqiuError("account_mismatch", "雪球 HTTP 会话账号与配置不一致，请人工确认")
+    status, body, cookies = perform_session_request(req, session)
+    result = parse_response(body, stage, status)
+    try:
+        save_http_session(cookies, session["user_agent"], expected_user)
+        save_cookie(session_cookie_header(cookies), session["user_agent"])
+    except OSError:
+        print("Warning: Xueqiu HTTP session could not be saved", file=sys.stderr)
+    return status, body, result
+
+
 def save_response_cookies(headers) -> None:
     cookies = SimpleCookie()
     cookies.load(get_xueqiu_cookie())
@@ -194,6 +277,8 @@ def parse_response(body: str, stage: str, http_status: int = 200) -> dict:
 
 
 def read_response(req: request.Request, stage: str) -> tuple[int, str, dict]:
+    if HTTP_SESSION_PATH.exists():
+        return read_session_response(req, stage)
     try:
         with request.urlopen(req, timeout=20) as resp:
             body = resp.read().decode("utf-8", errors="replace")

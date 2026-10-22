@@ -486,7 +486,9 @@ scripts/post_xueqiu_status.py \
 
 `post_xueqiu_status.py` 已内置上述流程。2026-10-19 修补：HTTP 响应中的 `Set-Cookie` 会更新 `.env`，发送时重新读取取令牌后更新的 Cookie；JSON 错误或 HTML 不再仅凭 HTTP 200 视为成功，发布必须返回帖子 ID。`--validate-only` 同时检查发送令牌和文本，已发帖的时段也可真实校验。
 
-取令牌时的 `400016`、访问验证页面，以及明确的 `400019` 拒绝会调用 `xueqiu_waf_refresh.py --write-env`，最多刷新并重试一次。网络异常、发布结果不明不自动重发。刷新使用本机 Google Chrome，优先连接 `127.0.0.1:9223`，否则使用 `run/xueqiu_chrome_profile/` 持久资料无界面启动；不再创建全新的临时登录环境。依赖 `playwright>=1.40,<2` 已加入 `requirements.txt`。刷新确认发送令牌有效后才保存 Cookie 和实际 User-Agent，账号不一致则停止。
+取令牌时的 `400016`、访问验证页面，以及明确的 `400019` 拒绝会调用 `xueqiu_waf_refresh.py --write-env`，最多刷新并重试一次。网络异常、发布结果不明不自动重发。刷新使用本机 Google Chrome，优先连接 `127.0.0.1:9223`，否则使用 `run/xueqiu_chrome_profile/` 持久资料无界面启动；不再创建全新的临时登录环境。当前依赖 `playwright>=1.46,<2`。刷新确认发送令牌有效后才保存 Cookie 和实际 User-Agent，账号不一致则停止。
+
+2026-10-22 补充修复：实测令牌请求会从 `xueqiu.com` 跳转至 `www.xueqiu.com`，浏览器上下文取令牌成功，但独立请求只携带扁平 Cookie 头仍失败。完整 Cookie（保留域、路径、有效期）导入 Playwright 独立 HTTP Cookie jar 后成功。正式发送优先使用 `run/xueqiu_http_session.json` 中的完整会话，不手动覆盖 Cookie 头，正常发送无需启动浏览器。会话文件以 `600` 权限原子写入且被 git 忽略；成功响应更新完整会话与兼容 `.env`，失败响应不覆盖已验证会话。刷新必须同时通过正式独立 HTTP 链路校验才记成功，摘要含 `checked_at` 和 `production_transport_checked`。旧的仅 `.env` 配置会在成功刷新后迁移。
 
 告警区分 `cookie_invalid` 和 `verification_required`，后者需要用户在相同 Chrome 资料目录中完成人机验证，不能用自动刷新替代。刷新日志只保存状态摘要。回归检查：`.venv/bin/python -m unittest discover -s tests -v`。
 
@@ -495,6 +497,7 @@ scripts/post_xueqiu_status.py \
 - `logs/xueqiu_post_history.jsonl`
 - `logs/xueqiu_cookie_alert.json`
 - `logs/xueqiu_waf_refresh.json`
+- `run/xueqiu_http_session.json`（凭据，不打印或提交）
 - `analysis/h30269/xueqiu_posts/`
 
 重复保护：
@@ -504,6 +507,7 @@ scripts/post_xueqiu_status.py \
 
 最新实测：
 
+- 2026-10-22 morning-close：修复跨域跳转的 Cookie 处理后补发成功（ID `413374740`），关闭登录浏览器后正式 HTTP 令牌和文本校验仍通过；回归测试包含真实跨主机跳转。
 - 2026-06-04 morning-close：HTTP 发帖成功。
 - 2026-06-04 afternoon-close：HTTP 发帖成功。
 - 2026-06-05 morning-close：HTTP 发帖成功。

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+from datetime import datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib import request
@@ -11,7 +12,7 @@ from urllib.error import URLError
 
 from dotenv import dotenv_values
 
-from post_xueqiu_status import parse_response, save_cookie, token_from_cookie, xueqiu_headers
+from post_xueqiu_status import parse_response, perform_session_request, save_cookie, save_http_session, session_cookie_header, token_from_cookie, xueqiu_headers
 
 
 BASE = Path(__file__).resolve().parents[1]
@@ -86,8 +87,8 @@ def refresh(write_env: bool) -> dict:
             )
         page = None
         try:
-            existing = context.cookies(["https://xueqiu.com/"])
-            existing_header = merge_cookie_header("", existing)
+            existing = context.cookies()
+            existing_header = session_cookie_header(existing)
             profile_user = token_from_cookie(existing_header, "u")
             if expected_user and profile_user and profile_user != expected_user:
                 return {"ok": False, "reason": "account_mismatch", "detail": "雪球浏览器账号与配置不一致，请人工确认"}
@@ -102,8 +103,9 @@ def refresh(write_env: bool) -> dict:
             if "check.xueqiu.com" in page.url or any(s in title + text for s in ("访问触发保护", "请完成人机验证", "aliyun_waf", "_waf_")):
                 return {"ok": False, "reason": "verification_required", "detail": "雪球触发访问保护，请在浏览器完成人机验证"}
             # Cookie presence alone does not prove the session is still accepted.
-            browser_cookie = merge_cookie_header("", context.cookies(["https://xueqiu.com/"]))
+            browser_cookie = session_cookie_header(context.cookies())
             headers = xueqiu_headers(browser_cookie)
+            headers.pop("Cookie", None)
             headers["User-Agent"] = page.evaluate("navigator.userAgent")
             response = context.request.get(
                 "https://xueqiu.com/provider/session/token.json?api_path=%2Fstatuses%2Fupdate.json",
@@ -113,16 +115,26 @@ def refresh(write_env: bool) -> dict:
             result = parse_response(response.text(), "token", response.status)
             if not result.get("session_token"):
                 return {"ok": False, "reason": "cookie_invalid", "detail": "浏览器登录态未恢复，请重新登录雪球"}
-            cookies = context.cookies(["https://xueqiu.com/"])
-            new_cookie = merge_cookie_header("", cookies)
+            cookies = context.cookies()
+            new_cookie = session_cookie_header(cookies)
             user = token_from_cookie(new_cookie, "u")
             if expected_user and user != expected_user:
                 return {"ok": False, "reason": "account_mismatch", "detail": "刷新后的雪球账号与配置不一致，请人工确认"}
             if not token_from_cookie(new_cookie, "xq_a_token"):
                 return {"ok": False, "reason": "cookie_invalid", "detail": "浏览器缺少雪球登录凭据，请重新登录"}
             if write_env:
-                save_cookie(new_cookie, page.evaluate("navigator.userAgent"))
-            return {"ok": True, "source": "open_browser" if attached else "persistent_profile", "cookie_count": len(cookies), "env_updated": write_env}
+                user_agent = page.evaluate("navigator.userAgent")
+                req = request.Request(
+                    "https://xueqiu.com/provider/session/token.json?api_path=%2Fstatuses%2Fupdate.json",
+                    headers=xueqiu_headers(new_cookie),
+                )
+                status, body, cookies = perform_session_request(req, {"cookies": cookies, "user_agent": user_agent}, playwright=pw)
+                result = parse_response(body, "token", status)
+                if not result.get("session_token"):
+                    return {"ok": False, "reason": "cookie_invalid", "detail": "正式 HTTP 链路校验未通过"}
+                save_http_session(cookies, user_agent, user)
+                save_cookie(session_cookie_header(cookies), user_agent)
+            return {"ok": True, "source": "open_browser" if attached else "persistent_profile", "cookie_count": len(cookies), "env_updated": write_env, "http_session_saved": write_env, "production_transport_checked": write_env}
         finally:
             if page is not None:
                 page.close()
@@ -142,6 +154,7 @@ def main() -> int:
     except Exception as exc:
         # Browser exceptions can contain page source; keep credentials out of logs.
         payload = {"ok": False, "reason": getattr(exc, "reason", "refresh_failed"), "detail": "雪球浏览器刷新未恢复，请检查登录或验证状态", "error_type": type(exc).__name__}
+    payload["checked_at"] = datetime.now().isoformat(timespec="seconds")
     LOG_PATH.parent.mkdir(exist_ok=True)
     LOG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(payload, ensure_ascii=False))

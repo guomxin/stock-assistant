@@ -4,11 +4,15 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from email.message import Message
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
+from urllib.request import Request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import post_xueqiu_status as post
@@ -28,6 +32,9 @@ class XueqiuTests(unittest.TestCase):
         self.base_patch = patch.object(post, "BASE_DIR", self.base)
         self.base_patch.start()
         self.addCleanup(self.base_patch.stop)
+        self.session_patch = patch.object(post, "HTTP_SESSION_PATH", self.base / "run/session.json")
+        self.session_patch.start()
+        self.addCleanup(self.session_patch.stop)
         post.save_cookie("xq_a_token=old; xq_id_token=id; u=123; removable=old")
 
     def response(self, body, cookies=()):
@@ -155,7 +162,7 @@ class XueqiuTests(unittest.TestCase):
         cookie = refresh.merge_cookie_header("", [{"name":"u","value":"123","domain":".xueqiu.com"}, {"name":"bad","value":"secret","domain":"evilxueqiu.com"}])
         self.assertEqual(cookie, "u=123")
 
-    def browser_refresh(self, user="123", captcha=False):
+    def browser_refresh(self, user="123", captcha=False, production_error=None):
         context = Mock()
         context.cookies.return_value = [{"name":"u", "value":user, "domain":".xueqiu.com"}, {"name":"xq_a_token", "value":"browser-new", "domain":".xueqiu.com"}]
         page = context.new_page.return_value
@@ -171,7 +178,7 @@ class XueqiuTests(unittest.TestCase):
         manager = Mock()
         manager.__enter__ = Mock(return_value=playwright)
         manager.__exit__ = Mock(return_value=False)
-        with patch("playwright.sync_api.sync_playwright", return_value=manager), patch.object(refresh.request, "urlopen", side_effect=URLError("closed")), patch.object(refresh, "load_cookie", return_value=post.get_xueqiu_cookie()), patch.object(refresh, "PROFILE_PATH", self.base / "profile"), patch.object(refresh, "ENV_PATH", self.env), patch.object(refresh, "save_cookie") as save:
+        with patch("playwright.sync_api.sync_playwright", return_value=manager), patch.object(refresh.request, "urlopen", side_effect=URLError("closed")), patch.object(refresh, "load_cookie", return_value=post.get_xueqiu_cookie()), patch.object(refresh, "PROFILE_PATH", self.base / "profile"), patch.object(refresh, "ENV_PATH", self.env), patch.object(refresh, "perform_session_request", side_effect=production_error, return_value=(200, '{"session_token":"session"}', context.cookies.return_value)), patch.object(refresh, "save_cookie") as save:
             result = refresh.refresh(True)
         return result, context, save
 
@@ -182,6 +189,11 @@ class XueqiuTests(unittest.TestCase):
         self.assertIn("xq_a_token=browser-new", save.call_args.args[0])
         self.assertEqual(save.call_args.args[1], "browser-agent")
         context.close.assert_called_once()
+
+    def test_browser_success_is_insufficient_when_production_http_fails(self):
+        with self.assertRaises(post.XueqiuError):
+            self.browser_refresh(production_error=post.XueqiuError("verification_required", "blocked"))
+        self.assertFalse(post.HTTP_SESSION_PATH.exists())
 
     def test_browser_verification_does_not_overwrite_cookie(self):
         result, context, save = self.browser_refresh(captcha=True)
@@ -194,6 +206,90 @@ class XueqiuTests(unittest.TestCase):
         self.assertEqual(result["reason"], "account_mismatch")
         context.new_page.assert_not_called()
         save.assert_not_called()
+
+    def session_cookies(self):
+        return [{"name":name, "value":value, "domain":".xueqiu.com", "path":"/", "secure":True, "httpOnly":True, "sameSite":"Lax", "expires":int(time.time()) + 3600} for name, value in (("u", "123"), ("xq_a_token", "current"))]
+
+    def test_session_retains_cookie_metadata_and_private_permissions(self):
+        cookies = self.session_cookies()
+        post.save_http_session(cookies, "agent", "123")
+        state = json.loads(post.HTTP_SESSION_PATH.read_text())
+        self.assertEqual(state["cookies"], cookies)
+        self.assertEqual(post.HTTP_SESSION_PATH.stat().st_mode & 0o777, 0o600)
+
+    def test_session_header_matches_cookie_path_and_expiry(self):
+        cookies = self.session_cookies()
+        cookies.extend([
+            {**cookies[0], "name":"scoped", "path":"/provider", "value":"yes"},
+            {**cookies[0], "name":"expired", "expires":1},
+        ])
+        self.assertNotIn("scoped", post.session_cookie_header(cookies))
+        self.assertIn("scoped=yes", post.session_cookie_header(cookies, "https://www.xueqiu.com/provider/session/token.json"))
+        self.assertNotIn("expired", post.session_cookie_header(cookies))
+
+    def test_structured_session_refuses_wrong_account(self):
+        post.save_http_session(self.session_cookies(), "agent", "456")
+        with patch.object(post, "perform_session_request") as perform:
+            with self.assertRaises(post.XueqiuError) as caught:
+                post.get_session_token()
+        self.assertEqual(caught.exception.reason, "account_mismatch")
+        perform.assert_not_called()
+
+    def test_structured_response_updates_cookie_without_losing_expiry(self):
+        cookies = self.session_cookies()
+        post.save_http_session(cookies, "agent", "123")
+        updated = [{**c, "value":"rotated"} if c["name"] == "xq_a_token" else c for c in cookies]
+        with patch.object(post, "perform_session_request", return_value=(200, '{"session_token":"session"}', updated)):
+            self.assertEqual(post.get_session_token(), "session")
+        state = json.loads(post.HTTP_SESSION_PATH.read_text())
+        self.assertEqual(state["cookies"], updated)
+        self.assertIn("xq_a_token=rotated", post.get_xueqiu_cookie())
+
+    def test_failed_response_does_not_replace_authenticated_session(self):
+        cookies = self.session_cookies()
+        post.save_http_session(cookies, "agent", "123")
+        before = post.HTTP_SESSION_PATH.read_text()
+        with patch.object(post, "perform_session_request", return_value=(200, '<html>请完成人机验证</html>', [])):
+            with self.assertRaises(post.XueqiuError):
+                post.get_session_token()
+        self.assertEqual(post.HTTP_SESSION_PATH.read_text(), before)
+
+    def test_http_redirect_reselects_cookie_for_destination_host(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == "/start":
+                    self.send_response(302)
+                    self.send_header("Location", f"http://localhost:{self.server.server_port}/token")
+                    self.end_headers()
+                    return
+                ok = "login=retained" in self.headers.get("Cookie", "")
+                self.send_response(200 if ok else 401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"session_token":"test"}' if ok else b'{"error_code":"400016"}')
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            state = {"user_agent":"test-agent", "cookies":[{"name":"login", "value":"retained", "domain":"localhost", "path":"/token", "secure":False, "httpOnly":True, "sameSite":"Lax", "expires":int(time.time()) + 3600}]}
+            req = Request(f"http://127.0.0.1:{server.server_port}/start", headers={"Cookie":"obsolete=flat"})
+            status, body, _ = post.perform_session_request(req, state)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["session_token"], "test")
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as pw:
+                status, body, _ = post.perform_session_request(req, state, playwright=pw)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["session_token"], "test")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":
